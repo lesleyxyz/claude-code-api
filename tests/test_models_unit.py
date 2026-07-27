@@ -23,11 +23,11 @@ def test_latest_opus_and_sonnet_are_available():
 
 def test_model_aliases_resolve_to_current_models():
     assert claude_models.validate_claude_model("claude-opus-4-7") == "claude-opus-4-7"
-    assert claude_models.validate_claude_model("opus") == "claude-opus-4-7"
-    assert claude_models.validate_claude_model("sonnet") == "claude-sonnet-4-6"
+    assert claude_models.validate_claude_model("opus") == "claude-opus-5"
+    assert claude_models.validate_claude_model("sonnet") == "claude-sonnet-5"
     assert (
         claude_models.validate_claude_model("claude-sonnet-latest")
-        == "claude-sonnet-4-6"
+        == "claude-sonnet-5"
     )
 
 

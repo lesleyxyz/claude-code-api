@@ -93,7 +93,7 @@ async def test_claude_process_redirects_stdin_to_devnull(monkeypatch):
 async def test_create_session_rejects_duplicate_active_session(monkeypatch, tmp_path):
     manager = cm.ClaudeManager()
 
-    async def fake_start(self, prompt, model=None, system_prompt=None):
+    async def fake_start(self, prompt, model=None, system_prompt=None, **_kwargs):
         self.is_running = True
         return True
 
@@ -121,7 +121,7 @@ async def test_create_session_rejects_duplicate_active_session(monkeypatch, tmp_
 async def test_create_session_replaces_stale_process(monkeypatch, tmp_path):
     manager = cm.ClaudeManager()
 
-    async def fake_start(self, prompt, model=None, system_prompt=None):
+    async def fake_start(self, prompt, model=None, system_prompt=None, **_kwargs):
         self.is_running = True
         return True
 
@@ -164,7 +164,7 @@ async def test_create_session_retries_opus_45_when_opus_46_rejected(
         ],
     )
 
-    async def fake_start(self, prompt, model=None, system_prompt=None):
+    async def fake_start(self, prompt, model=None, system_prompt=None, **_kwargs):
         attempted_models.append(model)
         if model == "claude-opus-4-6-20260205":
             self.last_error = "invalid model: claude-opus-4-6-20260205"
@@ -203,7 +203,7 @@ async def test_create_session_raises_when_model_rejected_without_fallback(
         lambda: [types.SimpleNamespace(id="claude-sonnet-4-5-20250929")],
     )
 
-    async def fake_start(self, prompt, model=None, system_prompt=None):
+    async def fake_start(self, prompt, model=None, system_prompt=None, **_kwargs):
         self.last_error = "unsupported model"
         self.is_running = False
         return False
@@ -234,7 +234,7 @@ async def test_create_session_raises_for_non_model_start_failure_without_fallbac
         lambda: [types.SimpleNamespace(id="claude-opus-4-5-20251101")],
     )
 
-    async def fake_start(self, prompt, model=None, system_prompt=None):
+    async def fake_start(self, prompt, model=None, system_prompt=None, **_kwargs):
         attempted_models.append(model)
         self.last_error = "failed to spawn process"
         self.is_running = False
@@ -261,7 +261,7 @@ async def test_create_session_without_model_does_not_force_model_flag(
     manager = cm.ClaudeManager()
     attempted_models = []
 
-    async def fake_start(self, prompt, model=None, system_prompt=None):
+    async def fake_start(self, prompt, model=None, system_prompt=None, **_kwargs):
         attempted_models.append(model)
         self.is_running = True
         return True

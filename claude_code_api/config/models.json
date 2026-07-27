@@ -1,8 +1,8 @@
 {
-  "default_model": "claude-sonnet-4-6",
+  "default_model": "claude-sonnet-5",
   "aliases": {
-    "opus": "claude-opus-4-7",
-    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-5",
+    "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4-5-20251001",
 
     "claude-opus-latest": "claude-opus-4-7",
@@ -16,9 +16,65 @@
     "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
 
     "claude-haiku-latest": "claude-haiku-4-5-20251001",
-    "claude-haiku-4-5": "claude-haiku-4-5-20251001"
+    "claude-haiku-4-5": "claude-haiku-4-5-20251001",
+
+    "claude-opus-5": "claude-opus-5",
+    "claude-opus-4-8": "claude-opus-4-8",
+    "claude-sonnet-5": "claude-sonnet-5",
+    "claude-fable-5": "claude-fable-5",
+    "claude-mythos-5": "claude-mythos-5"
   },
   "models": [
+    {
+      "id": "claude-fable-5",
+      "name": "Claude Fable 5",
+      "description": "Anthropic's most capable widely released model, for the most demanding reasoning and long-horizon agentic work",
+      "max_tokens": 131072,
+      "input_cost_per_1k": 0.01,
+      "output_cost_per_1k": 0.05,
+      "supports_streaming": true,
+      "supports_tools": true
+    },
+    {
+      "id": "claude-mythos-5",
+      "name": "Claude Mythos 5",
+      "description": "Same capabilities and pricing as Claude Fable 5; available exclusively through Project Glasswing",
+      "max_tokens": 131072,
+      "input_cost_per_1k": 0.01,
+      "output_cost_per_1k": 0.05,
+      "supports_streaming": true,
+      "supports_tools": true
+    },
+    {
+      "id": "claude-opus-5",
+      "name": "Claude Opus 5",
+      "description": "Most capable Claude model for complex agentic coding and enterprise work",
+      "max_tokens": 131072,
+      "input_cost_per_1k": 0.005,
+      "output_cost_per_1k": 0.025,
+      "supports_streaming": true,
+      "supports_tools": true
+    },
+    {
+      "id": "claude-opus-4-8",
+      "name": "Claude Opus 4.8",
+      "description": "Most capable model in the Opus 4 series, state-of-the-art on long-horizon agentic work and knowledge work",
+      "max_tokens": 131072,
+      "input_cost_per_1k": 0.005,
+      "output_cost_per_1k": 0.025,
+      "supports_streaming": true,
+      "supports_tools": true
+    },
+    {
+      "id": "claude-sonnet-5",
+      "name": "Claude Sonnet 5",
+      "description": "Best combination of speed and intelligence, near-Opus quality on coding and agentic work",
+      "max_tokens": 131072,
+      "input_cost_per_1k": 0.003,
+      "output_cost_per_1k": 0.015,
+      "supports_streaming": true,
+      "supports_tools": true
+    },
     {
       "id": "claude-opus-4-7",
       "name": "Claude Opus 4.7",

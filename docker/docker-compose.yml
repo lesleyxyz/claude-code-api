@@ -3,6 +3,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: ghcr.io/lesleyxyz/claude-code-api:latest
     container_name: claude-code-api
     ports:
       - "127.0.0.1:8000:8000"  # API server port

@@ -1,6 +1,14 @@
 # Claude Code API Gateway
 
 OpenAI-compatible API gateway for Claude Code CLI.
+This is a fork based on codingworkflow's claude-code-api with the following additional functionalities:
+- Support for json_schema
+- Support for function tools
+- Support for `/v1/responses` API
+- Daily docker builds for vulnerabilities at `ghcr.io/lesleyxyz/claude-code-api:latest`
+- Latest Anthropic models
+
+This project is a wrapper around claude-code CLI such that it does not violate Anthropic's Terms of Service.
 
 ## What You Get
 
@@ -84,6 +92,63 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "stream": true
   }'
 ```
+
+Tool calling:
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Classify this invoice"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "classify",
+        "description": "Classify a document",
+        "parameters": {
+          "type": "object",
+          "properties": {"title": {"type": "string"}},
+          "required": ["title"]
+        }
+      }
+    }],
+    "tool_choice": "required"
+  }'
+```
+
+The Claude CLI has no notion of caller-supplied tools, so `tools` is emulated on
+top of its `--json-schema` support: the declared tools are described in the
+system prompt, output is constrained to a `{content, tool_calls}` envelope, and
+the validated JSON is unpacked into standard OpenAI `tool_calls`. `tool_choice`
+accepts `none`, `auto` (default), `required`/`any`, or a named function, and
+`parallel_tool_calls: false` caps the response at one call. Claude's own
+built-in tools are never surfaced as `tool_calls`.
+
+Structured output:
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Classify this invoice"}],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {"name": "doc", "schema": {"type": "object"}}
+    }
+  }'
+```
+
+The schema is passed to the CLI's `--json-schema` flag and the validated JSON
+arrives in `message.content`.
+
+The two are independent, as in the OpenAI API: `tools` constrains the calls,
+`response_format` constrains the content message. Send both and the caller's
+schema becomes the schema of the envelope's `content` slot, so the model can
+either call a tool or answer in the requested shape. Definitions from the two
+schemas are namespaced (`tool_` / `content_`) when hoisted, so a `$defs` entry
+that appears on both sides cannot collapse into one. The exception is
+`tool_choice: "required"`, which leaves no content message to constrain -
+`response_format` is then unreachable and the gateway logs a warning.
 
 ## Configuration
 

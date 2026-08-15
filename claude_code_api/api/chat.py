@@ -35,6 +35,7 @@ from claude_code_api.utils.streaming import (
     create_sse_response,
 )
 from claude_code_api.utils.time import utc_timestamp
+from claude_code_api.utils.tools import ToolBridge, build_tool_bridge
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -132,6 +133,51 @@ def _extract_json_schema(request: ChatCompletionRequest) -> Optional[Dict[str, A
             "missing_json_schema",
         )
     return response_format.json_schema.schema_
+
+
+def _merge_system_prompt(system_prompt: Optional[str], addition: str) -> str:
+    """Append bridged-tool instructions to whatever system prompt the caller sent."""
+    if not system_prompt:
+        return addition
+    return f"{system_prompt}\n\n{addition}"
+
+
+def _apply_tool_bridge(
+    request: ChatCompletionRequest,
+    json_schema: Optional[Dict[str, Any]],
+    system_prompt: Optional[str],
+) -> Tuple[Optional[ToolBridge], Optional[Dict[str, Any]], Optional[str]]:
+    """Fold `tools`/`tool_choice` into the CLI's schema + system prompt.
+
+    Returns the bridge (None when tools are not in play) alongside the schema and
+    system prompt to actually run with. With no tools the caller's
+    `response_format` schema is passed through untouched; with tools it becomes
+    the schema of the envelope's `content` slot, so both OpenAI channels stay
+    available in the same request.
+    """
+    bridge = build_tool_bridge(request, content_schema=json_schema)
+    if bridge is None:
+        return None, json_schema, system_prompt
+
+    if json_schema is not None and bridge.force_tool_call:
+        logger.warning(
+            "response_format.json_schema cannot be honoured because tool_choice "
+            "forces a tool call, which leaves no content message to constrain",
+            tool_names=bridge.allowed_names,
+        )
+
+    logger.info(
+        "Bridging client tools onto --json-schema",
+        tool_names=bridge.allowed_names,
+        forced=bridge.force_tool_call,
+        parallel=bridge.allow_parallel,
+        has_content_schema=json_schema is not None,
+    )
+    return (
+        bridge,
+        bridge.schema,
+        _merge_system_prompt(system_prompt, bridge.instructions),
+    )
 
 
 def _extract_prompts(request: ChatCompletionRequest) -> Tuple[str, str]:
@@ -654,6 +700,7 @@ async def _collect_non_streaming_response(
     model: str,
     project_id: str,
     prefer_result_content: bool = False,
+    tool_bridge: Optional[ToolBridge] = None,
 ) -> Dict[str, Any]:
     messages, parser = await _gather_claude_messages(claude_process)
     _log_message_summary(messages)
@@ -670,6 +717,7 @@ async def _collect_non_streaming_response(
         usage_summary,
         project_id,
         prefer_result_content=prefer_result_content,
+        tool_bridge=tool_bridge,
     )
     _log_response_payload(response)
     return response
@@ -741,6 +789,7 @@ def _build_non_streaming_response(
     usage_summary: Dict[str, Any],
     project_id: str,
     prefer_result_content: bool = False,
+    tool_bridge: Optional[ToolBridge] = None,
 ) -> Dict[str, Any]:
     response = create_non_streaming_response(
         messages=messages,
@@ -748,6 +797,7 @@ def _build_non_streaming_response(
         model=model,
         usage=usage_summary,
         prefer_result_content=prefer_result_content,
+        tool_bridge=tool_bridge,
     )
     response["project_id"] = project_id
     return response
@@ -875,6 +925,9 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
 
         user_prompt, system_prompt = _extract_prompts(request)
         json_schema = _extract_json_schema(request)
+        tool_bridge, json_schema, system_prompt = _apply_tool_bridge(
+            request, json_schema, system_prompt
+        )
 
         # Handle project context
         project_id = request.project_id or f"default-{client_id}"
@@ -959,6 +1012,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                     response_model,
                     claude_process,
                     prefer_result_content=json_schema is not None,
+                    tool_bridge=tool_bridge,
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -977,6 +1031,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
             model=response_model,
             project_id=project_id,
             prefer_result_content=json_schema is not None,
+            tool_bridge=tool_bridge,
         )
 
     except HTTPException:

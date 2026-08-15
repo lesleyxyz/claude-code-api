@@ -13,8 +13,12 @@ class ToolFunction(BaseModel):
 
     name: str = Field(..., description="The name of the function to call")
     description: Optional[str] = Field(None, description="The function description")
-    parameters: Dict[str, Any] = Field(
-        ..., description="The JSON schema for the function parameters"
+    parameters: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "The JSON schema for the function parameters. Defaults to an empty "
+            "object schema when omitted."
+        ),
     )
 
 
@@ -171,11 +175,22 @@ class ChatCompletionRequest(BaseModel):
         None, description="Unique identifier representing your end-user"
     )
     tools: Optional[List[ToolDefinition]] = Field(
-        None, description="Tools available for the model to call"
+        None,
+        description=(
+            "Tools available for the model to call. Emulated on top of the CLI's "
+            "--json-schema support, so calls are returned as OpenAI tool_calls."
+        ),
     )
     tool_choice: Optional[Union[str, ToolChoice]] = Field(
         None,
-        description="Tool choice preference (e.g. 'auto', 'none', or a specific tool)",
+        description=(
+            "Tool choice preference: 'none' disables tools, 'auto' (default) lets "
+            "the model choose, 'required'/'any' forces a call, or name a specific tool."
+        ),
+    )
+    parallel_tool_calls: Optional[bool] = Field(
+        None,
+        description="Whether the model may emit more than one tool call at a time",
     )
     response_format: Optional[ResponseFormat] = Field(
         None,

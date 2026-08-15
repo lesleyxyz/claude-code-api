@@ -20,5 +20,11 @@
       "hello"
     ],
     "file": "claude_stream_simple.jsonl"
+  },
+  {
+    "match": [
+      "classify this document"
+    ],
+    "file": "claude_stream_tool_bridge.jsonl"
   }
 ]

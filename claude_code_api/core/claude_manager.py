@@ -70,6 +70,7 @@ class ClaudeProcess:
                     "--output-format",
                     "stream-json",
                     "--verbose",
+                    "--safe-mode",
                     "--dangerously-skip-permissions",
                 ]
             )

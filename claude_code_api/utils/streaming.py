@@ -66,6 +66,7 @@ class OpenAIStreamConverter:
         session_id: str,
         prefer_result_content: bool = False,
         tool_bridge: Optional[ToolBridge] = None,
+        suppress_internal_tools: bool = False,
     ):
         self.model = model
         self.session_id = session_id
@@ -76,6 +77,9 @@ class OpenAIStreamConverter:
         self.tool_call_index = 0
         self.prefer_result_content = prefer_result_content
         self.tool_bridge = tool_bridge
+        self.suppress_internal_tools = (
+            suppress_internal_tools or prefer_result_content
+        )
 
     def _build_chunk(
         self, delta: Dict[str, Any], finish_reason: Optional[str] = None
@@ -120,9 +124,10 @@ class OpenAIStreamConverter:
                 )
                 saw_text = True
 
-        # Claude's own built-in tools are an implementation detail of schema mode.
-        # Leaking them would hand the client tool calls it never asked for.
-        if not self.prefer_result_content:
+        # Claude's own built-in tools are an implementation detail. Leaking them
+        # would hand the client tool calls it never declared - and a client that
+        # sent tool_choice:"none" asked for none at all.
+        if not self.suppress_internal_tools:
             tool_uses = self.parser.extract_tool_uses(message)
             if tool_uses:
                 tool_calls = self._build_tool_calls(tool_uses)
@@ -235,6 +240,7 @@ class StreamingManager:
         claude_process: ClaudeProcess,
         prefer_result_content: bool = False,
         tool_bridge: Optional[ToolBridge] = None,
+        suppress_internal_tools: bool = False,
     ) -> AsyncGenerator[str, None]:
         """Create new streaming connection."""
         converter = OpenAIStreamConverter(
@@ -242,6 +248,7 @@ class StreamingManager:
             session_id,
             prefer_result_content=prefer_result_content,
             tool_bridge=tool_bridge,
+            suppress_internal_tools=suppress_internal_tools,
         )
         heartbeat_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
         self.active_streams[session_id] = StreamState(
@@ -394,6 +401,7 @@ async def create_sse_response(
     claude_process: ClaudeProcess,
     prefer_result_content: bool = False,
     tool_bridge: Optional[ToolBridge] = None,
+    suppress_internal_tools: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Create SSE response for Claude Code output."""
     try:
@@ -403,6 +411,7 @@ async def create_sse_response(
             claude_process,
             prefer_result_content=prefer_result_content,
             tool_bridge=tool_bridge,
+            suppress_internal_tools=suppress_internal_tools,
         ):
             yield chunk
     except Exception as e:
@@ -480,6 +489,7 @@ def create_non_streaming_response(
     usage: Optional[Dict[str, Any]] = None,
     prefer_result_content: bool = False,
     tool_bridge: Optional[ToolBridge] = None,
+    suppress_internal_tools: bool = False,
 ) -> Dict[str, Any]:
     """Create non-streaming response."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
@@ -502,9 +512,13 @@ def create_non_streaming_response(
     else:
         complete_content = ""
 
+    if suppress_internal_tools:
+        # Claude's own built-in tool uses are an implementation detail; a client
+        # only ever hears about the tools it declared.
+        tool_calls = []
+
     if prefer_result_content:
-        # The schema-validated `result` payload is authoritative, and Claude's
-        # own built-in tool uses are an implementation detail of getting there.
+        # The schema-validated `result` payload is authoritative.
         tool_calls = []
         result_content = _extract_result_content(messages)
         if tool_bridge is not None:

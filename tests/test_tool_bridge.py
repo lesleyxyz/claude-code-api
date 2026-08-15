@@ -44,6 +44,17 @@ NESTED_SCHEMA = {
 }
 
 
+ARGUMENTS_POINTER = f"#/properties/{TOOL_CALLS_KEY}/items/properties/arguments"
+CONTENT_POINTER = "#/properties/content"
+
+
+def _arguments_of(bridge):
+    """The tool-arguments sub-schema inside a bridge's envelope."""
+    return bridge.schema["properties"][TOOL_CALLS_KEY]["items"]["properties"][
+        "arguments"
+    ]
+
+
 def _request(**overrides):
     payload = {
         "model": get_test_model_id(),
@@ -143,21 +154,22 @@ class TestBuildToolBridge:
 
         assert bridge.schema["properties"][TOOL_CALLS_KEY]["maxItems"] == 1
 
-    def test_nested_defs_are_hoisted_and_namespaced(self):
+    def test_nested_defs_are_rebased_in_place(self):
         tool = {
             "type": "function",
             "function": {"name": "Nested", "parameters": NESTED_SCHEMA},
         }
         bridge = build_tool_bridge(_request(tools=[tool], tool_choice="required"))
 
-        arguments = bridge.schema["properties"][TOOL_CALLS_KEY]["items"]["properties"][
-            "arguments"
-        ]
-        assert "$defs" not in arguments
-        assert arguments["properties"]["child"] == {"$ref": "#/$defs/tool_Child"}
-        assert bridge.schema["$defs"] == {"tool_Child": {"type": "object"}}
+        arguments = _arguments_of(bridge)
+        assert arguments["$defs"] == {"Child": {"type": "object"}}
+        assert arguments["properties"]["child"] == {
+            "$ref": f"{ARGUMENTS_POINTER}/$defs/Child"
+        }
+        # Nothing is hoisted, so the envelope root stays clean.
+        assert "$defs" not in bridge.schema
 
-    def test_legacy_definitions_keyword_is_normalized(self):
+    def test_legacy_definitions_keyword_is_rebased(self):
         legacy = {
             "type": "object",
             "properties": {"child": {"$ref": "#/definitions/Child"}},
@@ -169,14 +181,13 @@ class TestBuildToolBridge:
         }
         bridge = build_tool_bridge(_request(tools=[tool], tool_choice="required"))
 
-        arguments = bridge.schema["properties"][TOOL_CALLS_KEY]["items"]["properties"][
-            "arguments"
-        ]
-        assert "definitions" not in arguments
-        assert arguments["properties"]["child"] == {"$ref": "#/$defs/tool_Child"}
-        assert bridge.schema["$defs"] == {"tool_Child": {"type": "string"}}
+        arguments = _arguments_of(bridge)
+        assert arguments["definitions"] == {"Child": {"type": "string"}}
+        assert arguments["properties"]["child"] == {
+            "$ref": f"{ARGUMENTS_POINTER}/definitions/Child"
+        }
 
-    def test_refs_inside_definition_bodies_are_rewritten(self):
+    def test_refs_inside_definition_bodies_are_rebased(self):
         recursive = {
             "type": "object",
             "properties": {"node": {"$ref": "#/$defs/Node"}},
@@ -193,15 +204,78 @@ class TestBuildToolBridge:
         }
         bridge = build_tool_bridge(_request(tools=[tool], tool_choice="required"))
 
-        node = bridge.schema["$defs"]["tool_Node"]
-        assert node["properties"]["next"] == {"$ref": "#/$defs/tool_Node"}
+        node = _arguments_of(bridge)["$defs"]["Node"]
+        assert node["properties"]["next"] == {
+            "$ref": f"{ARGUMENTS_POINTER}/$defs/Node"
+        }
 
-    def test_no_defs_means_no_defs_block(self):
-        bridge = build_tool_bridge(
-            _request(tools=[CLASSIFIER_TOOL], tool_choice="required")
-        )
+    def test_root_recursive_ref_points_at_the_embedded_schema(self):
+        """OpenAI documents `#` for root recursion; it must not hit the envelope."""
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "Tree",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "kids": {"type": "array", "items": {"$ref": "#"}}
+                    },
+                },
+            },
+        }
+        bridge = build_tool_bridge(_request(tools=[tool], tool_choice="required"))
 
-        assert "$defs" not in bridge.schema
+        assert _arguments_of(bridge)["properties"]["kids"]["items"] == {
+            "$ref": ARGUMENTS_POINTER
+        }
+
+    def test_anchor_refs_are_left_alone(self):
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "Anchored",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"c": {"$ref": "#child"}},
+                    "$defs": {"Child": {"$anchor": "child", "type": "object"}},
+                },
+            },
+        }
+        bridge = build_tool_bridge(_request(tools=[tool], tool_choice="required"))
+
+        assert _arguments_of(bridge)["properties"]["c"] == {"$ref": "#child"}
+
+    def test_id_and_schema_keywords_are_stripped(self):
+        """`$id` would re-base every local ref onto a different document."""
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "Identified",
+                "parameters": {
+                    "$id": "https://example.com/tool.json",
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {"child": {"$ref": "#/$defs/Child"}},
+                    "$defs": {"Child": {"type": "object"}},
+                },
+            },
+        }
+        bridge = build_tool_bridge(_request(tools=[tool], tool_choice="required"))
+
+        arguments = _arguments_of(bridge)
+        assert "$id" not in arguments
+        assert "$schema" not in arguments
+
+    def test_the_callers_schema_is_never_mutated(self):
+        original = json.loads(json.dumps(NESTED_SCHEMA))
+        tool = {
+            "type": "function",
+            "function": {"name": "Nested", "parameters": NESTED_SCHEMA},
+        }
+
+        build_tool_bridge(_request(tools=[tool], tool_choice="required"))
+
+        assert NESTED_SCHEMA == original
 
     def test_tool_without_parameters_is_accepted(self):
         tool = {"type": "function", "function": {"name": "Ping"}}
@@ -269,17 +343,17 @@ class TestCombinedWithResponseFormat:
             _request(tools=[tool]), content_schema=caller_schema
         )
 
-        assert bridge.schema["$defs"] == {
-            "tool_Child": {"type": "object"},
-            "content_Child": {"type": "string"},
+        content = bridge.schema["properties"]["content"]
+        assert content["$defs"] == {"Child": {"type": "string"}}
+        assert content["properties"]["child"] == {
+            "$ref": f"{CONTENT_POINTER}/$defs/Child"
         }
-        assert bridge.schema["properties"]["content"]["properties"]["child"] == {
-            "$ref": "#/$defs/content_Child"
+
+        arguments = _arguments_of(bridge)
+        assert arguments["$defs"] == {"Child": {"type": "object"}}
+        assert arguments["properties"]["child"] == {
+            "$ref": f"{ARGUMENTS_POINTER}/$defs/Child"
         }
-        arguments = bridge.schema["properties"][TOOL_CALLS_KEY]["items"]["properties"][
-            "arguments"
-        ]
-        assert arguments["properties"]["child"] == {"$ref": "#/$defs/tool_Child"}
 
     def test_instructions_show_the_content_schema(self):
         bridge = build_tool_bridge(
@@ -323,6 +397,18 @@ class TestCombinedWithResponseFormat:
 
         assert content is None
         assert tool_calls[0]["function"]["name"] == "DocumentClassifierSchema"
+
+    def test_string_content_keeps_its_json_quoting(self):
+        """Must match the no-tools path, where the CLI returns JSON text."""
+        bridge = build_tool_bridge(
+            _request(tools=[CLASSIFIER_TOOL]),
+            content_schema={"type": "string", "enum": ["spam", "ham"]},
+        )
+
+        content, _ = bridge.convert_result('{"content": "spam"}')
+
+        assert content == '"spam"'
+        assert json.loads(content) == "spam"
 
     def test_bare_caller_schema_object_passes_through_as_content(self):
         """A model that skips the envelope still satisfies response_format."""
@@ -421,6 +507,67 @@ class TestConvertResult:
 
         assert content == "Sorry, I cannot do that."
         assert tool_calls == []
+
+    def test_empty_envelope_does_not_leak_its_own_json(self, bridge):
+        """A valid but empty envelope must not become the assistant's answer."""
+        assert bridge.convert_result('{"tool_calls": []}') == (None, [])
+        assert bridge.convert_result('{"content": "", "tool_calls": []}') == (None, [])
+
+    def test_json_string_arguments_are_parsed(self, bridge):
+        """OpenAI puts arguments on the wire as a string; the model may copy that."""
+        result = json.dumps(
+            {
+                TOOL_CALLS_KEY: [
+                    {
+                        "name": "DocumentClassifierSchema",
+                        "arguments": '{"title":"ACME"}',
+                    }
+                ]
+            }
+        )
+
+        _, tool_calls = bridge.convert_result(result)
+
+        assert json.loads(tool_calls[0]["function"]["arguments"]) == {"title": "ACME"}
+
+    def test_openai_native_call_shape_is_accepted(self, bridge):
+        result = json.dumps(
+            {
+                TOOL_CALLS_KEY: [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "DocumentClassifierSchema",
+                            "arguments": '{"title":"ACME"}',
+                        },
+                    }
+                ]
+            }
+        )
+
+        _, tool_calls = bridge.convert_result(result)
+
+        assert tool_calls[0]["function"]["name"] == "DocumentClassifierSchema"
+        assert json.loads(tool_calls[0]["function"]["arguments"]) == {"title": "ACME"}
+
+    def test_arguments_are_always_an_object(self, bridge):
+        """Clients do fn(**json.loads(arguments)), which needs a mapping."""
+        for raw in ('[{"title":"A"}]', '"oops"', "42"):
+            result = (
+                f'{{"{TOOL_CALLS_KEY}":[{{"name":"DocumentClassifierSchema",'
+                f'"arguments":{raw}}}]}}'
+            )
+            _, tool_calls = bridge.convert_result(result)
+            parsed = json.loads(tool_calls[0]["function"]["arguments"])
+            assert isinstance(parsed, dict), raw
+
+    def test_bare_object_unrelated_to_the_tool_is_not_a_tool_call(self, bridge):
+        """An error payload that happens to be JSON must not become a call."""
+        content, tool_calls = bridge.convert_result('{"retry_after": 30}')
+
+        assert tool_calls == []
+        assert content == '{"retry_after": 30}'
 
     def test_empty_result_is_empty(self, bridge):
         assert bridge.convert_result("") == (None, [])
@@ -568,6 +715,38 @@ class TestToolBridgeEndToEnd:
             for event in events
             for choice in event.get("choices", [])
         )
+
+    def test_tool_choice_none_still_hides_claude_internal_tools(self, test_client):
+        """A client asking for no tools must not receive Claude's own."""
+        response = test_client.post(
+            "/v1/chat/completions",
+            json=self._payload(
+                messages=[{"role": "user", "content": "Please use a tool to list files"}],
+                tool_choice="none",
+            ),
+        )
+        assert response.status_code == 200
+
+        choice = response.json()["choices"][0]
+        assert choice["message"].get("tool_calls") is None
+        assert choice["finish_reason"] == "stop"
+
+    def test_plain_requests_still_surface_claude_tools(self, test_client):
+        """Without a `tools` field the old passthrough behaviour is untouched."""
+        response = test_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": get_test_model_id(),
+                "messages": [
+                    {"role": "user", "content": "Please use a tool to list files"}
+                ],
+                "stream": False,
+            },
+        )
+        assert response.status_code == 200
+
+        message = response.json()["choices"][0]["message"]
+        assert message["tool_calls"][0]["function"]["name"] == "bash"
 
     def test_tool_choice_none_keeps_plain_text_behaviour(self, test_client):
         response = test_client.post(

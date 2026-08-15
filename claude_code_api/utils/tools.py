@@ -45,7 +45,15 @@ _GENERIC_ARGUMENTS_SCHEMA: Dict[str, Any] = {
 
 _FENCED_JSON = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
-_DEFS_KEYS = ("$defs", "definitions")
+# Where each caller sub-schema ends up inside the envelope. Local `$ref`s are
+# rebased onto these pointers, so a sub-schema keeps referring to itself rather
+# than to the envelope root.
+_CONTENT_POINTER = "#/properties/content"
+_ARGUMENTS_POINTER = f"#/properties/{TOOL_CALLS_KEY}/items/properties/arguments"
+
+# Meaningless once a sub-schema is embedded, and actively harmful: `$id` would
+# re-base every local ref onto a different document.
+_EMBED_STRIPPED_KEYS = ("$id", "$schema")
 
 
 @dataclass
@@ -141,76 +149,67 @@ def _normalize_tools(tools: Any) -> List[BridgedTool]:
     return normalized
 
 
-def _rewrite_refs(node: Any, prefix: str) -> Any:
-    """Repoint root-relative `$ref`s at their namespaced definitions."""
+def _rebase_refs(node: Any, base: str) -> Any:
+    """Repoint local `$ref`s at the sub-schema's new home inside the envelope."""
     if isinstance(node, dict):
-        rewritten: Dict[str, Any] = {}
+        rebased: Dict[str, Any] = {}
         for key, value in node.items():
             if key == "$ref" and isinstance(value, str):
-                for pointer in ("#/$defs/", "#/definitions/"):
-                    if value.startswith(pointer):
-                        value = f"#/$defs/{prefix}{value[len(pointer):]}"
-                        break
+                if value == "#":
+                    # OpenAI's documented root recursion.
+                    value = base
+                elif value.startswith("#/"):
+                    value = f"{base}{value[1:]}"
+                # `#anchor` refs are resolved by anchor, not by location, so
+                # they survive the move untouched.
             else:
-                value = _rewrite_refs(value, prefix)
-            rewritten[key] = value
-        return rewritten
+                value = _rebase_refs(value, base)
+            rebased[key] = value
+        return rebased
     if isinstance(node, list):
-        return [_rewrite_refs(item, prefix) for item in node]
+        return [_rebase_refs(item, base) for item in node]
     return node
 
 
-def _extract_defs(schema: Dict[str, Any], prefix: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Hoist `$defs`/`definitions` out of a sub-schema, under a namespace.
+def _embed(schema: Dict[str, Any], base: str) -> Dict[str, Any]:
+    """Prepare a caller sub-schema to sit at `base` inside the envelope.
 
-    Nested pydantic models produce root-relative `$ref`s (``#/$defs/Foo``). Once
-    the schema is embedded inside the envelope those refs only resolve if the
-    definitions live at the document root. The tool schema and the caller's
-    `response_format` schema are hoisted side by side, so each keeps its own
-    prefix: two unrelated models that both define a `Foo` must not silently
-    collapse into one definition.
+    A caller schema is written as its own document: `$defs` at the top and refs
+    like ``#/$defs/Foo`` pointing at them. Embedded as-is, those refs would
+    resolve against the envelope root and hit nothing. Rebasing them onto the
+    embedding site keeps every definition where the caller put it - no hoisting,
+    no renaming, and no way for two schemas to collide over a shared name.
     """
-    inner = dict(schema)
-    collected: Dict[str, Any] = {}
-    for key in _DEFS_KEYS:
-        value = inner.pop(key, None)
-        if isinstance(value, dict):
-            collected.update(value)
-
-    if not collected:
-        return inner, {}
-
-    namespaced = {
-        f"{prefix}{name}": _rewrite_refs(body, prefix)
-        for name, body in collected.items()
-    }
-    return _rewrite_refs(inner, prefix), namespaced
+    embedded = _rebase_refs(schema, base)
+    if not isinstance(embedded, dict):
+        return embedded
+    for key in _EMBED_STRIPPED_KEYS:
+        embedded.pop(key, None)
+    return embedded
 
 
-def _content_schema(bridge: ToolBridge) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Schema for the envelope's `content` slot, plus any definitions to hoist."""
+def _content_schema(bridge: ToolBridge) -> Dict[str, Any]:
+    """Schema for the envelope's `content` slot."""
     if bridge.content_schema is None:
         return {
             "type": "string",
             "description": "Plain-text answer, used only when no tool applies.",
-        }, {}
+        }
 
-    inner, defs = _extract_defs(bridge.content_schema, "content_")
+    inner = _embed(bridge.content_schema, _CONTENT_POINTER)
     inner.setdefault(
         "description",
         "Answer matching the response format the client requested. Used only "
         "when no tool applies.",
     )
-    return inner, defs
+    return inner
 
 
 def _build_schema(bridge: ToolBridge) -> Dict[str, Any]:
     single = bridge.single_tool
-    root_defs: Dict[str, Any] = {}
 
     if single is not None:
-        arguments_schema, tool_defs = _extract_defs(single.parameters, "tool_")
-        root_defs.update(tool_defs)
+        arguments_schema = _embed(single.parameters, _ARGUMENTS_POINTER)
     else:
         # With several tools in play the argument shape depends on which tool
         # the model picks, so it is described in the prompt instead.
@@ -245,9 +244,7 @@ def _build_schema(bridge: ToolBridge) -> Dict[str, Any]:
 
     if not bridge.force_tool_call:
         # Only leave room for an answer when the client did not demand a call.
-        content_schema, content_defs = _content_schema(bridge)
-        root_defs.update(content_defs)
-        properties["content"] = content_schema
+        properties["content"] = _content_schema(bridge)
         required = []
 
     schema: Dict[str, Any] = {
@@ -257,8 +254,6 @@ def _build_schema(bridge: ToolBridge) -> Dict[str, Any]:
     }
     if required:
         schema["required"] = required
-    if root_defs:
-        schema["$defs"] = root_defs
     return schema
 
 
@@ -384,9 +379,29 @@ def _loads_envelope(result_text: str) -> Optional[Any]:
     return None
 
 
+def _normalize_arguments(arguments: Any) -> Dict[str, Any]:
+    """Coerce whatever the model produced into an arguments object.
+
+    OpenAI puts tool arguments on the wire as a JSON *string*, so a model may
+    well hand one back that way. Clients do `json.loads(arguments)` and expect a
+    mapping, so anything that is not an object has to become one.
+    """
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return {"value": arguments}
+        arguments = parsed
+
+    if isinstance(arguments, dict):
+        return arguments
+    if arguments is None:
+        return {}
+    return {"value": arguments}
+
+
 def _tool_call_payload(name: str, arguments: Any) -> Dict[str, Any]:
-    if not isinstance(arguments, (dict, list)):
-        arguments = {} if arguments is None else {"value": arguments}
+    arguments = _normalize_arguments(arguments)
     return {
         "id": f"call_{uuid.uuid4().hex[:24]}",
         "type": "function",
@@ -415,34 +430,88 @@ def convert_envelope(
         return result_text.strip(), []
 
     raw_calls = payload.get(TOOL_CALLS_KEY)
+    # A forced envelope has no `content` slot, so only the calls key identifies
+    # one - otherwise a tool that declares its own `content` argument would be
+    # mistaken for an envelope.
+    is_envelope = TOOL_CALLS_KEY in payload or (
+        "content" in payload and not bridge.force_tool_call
+    )
 
-    if raw_calls is None and bridge.force_tool_call:
-        # The model skipped the envelope and returned the arguments directly.
-        single = bridge.single_tool
-        if single is not None:
-            logger.info("Recovered bare arguments object as a tool call")
-            return None, [_tool_call_payload(single.name, payload)]
+    if not is_envelope and bridge.force_tool_call:
+        recovered = _recover_bare_arguments(payload, bridge)
+        if recovered is not None:
+            return None, [recovered]
 
-    content = payload.get("content")
-    if isinstance(content, str):
-        content = content.strip() or None
-    elif content is not None:
-        # A structured `content` (the caller's response_format) has to reach the
-        # client as JSON text, exactly as the schema-only path delivers it.
-        content = json.dumps(content, separators=(",", ":"), ensure_ascii=False)
+    content = _envelope_content(payload, bridge)
 
     tool_calls: List[Dict[str, Any]] = []
     for raw_call in raw_calls or []:
-        if not isinstance(raw_call, dict):
-            continue
-        name = raw_call.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        tool_calls.append(_tool_call_payload(name, raw_call.get("arguments")))
+        parsed = _parse_call(raw_call)
+        if parsed is not None:
+            tool_calls.append(parsed)
 
-    if not tool_calls and content is None:
-        # Nothing usable in the envelope - surface the raw payload rather than
-        # returning an empty message.
+    if not tool_calls and content is None and not is_envelope:
+        # Not an envelope at all - surface the raw payload rather than an empty
+        # message. A genuine envelope that is simply empty stays empty: echoing
+        # its JSON back as the assistant's answer would be worse than nothing.
         return result_text.strip(), []
 
     return content, tool_calls
+
+
+def _envelope_content(payload: Dict[str, Any], bridge: ToolBridge) -> Optional[str]:
+    """The envelope's `content` slot, as the text the client will receive."""
+    content = payload.get("content")
+    if content is None:
+        return None
+
+    if isinstance(content, str) and bridge.content_schema is None:
+        return content.strip() or None
+
+    # Under a caller `response_format` the content is a JSON value, and has to
+    # reach the client as JSON text - quoting included, exactly as the
+    # schema-only path delivers it.
+    return json.dumps(content, separators=(",", ":"), ensure_ascii=False)
+
+
+def _parse_call(raw_call: Any) -> Optional[Dict[str, Any]]:
+    """One entry of the envelope's tool call list, in either shape."""
+    if not isinstance(raw_call, dict):
+        return None
+
+    # The model may reproduce OpenAI's own nested wire format instead of the
+    # flat {name, arguments} the schema asks for.
+    function = raw_call.get("function")
+    if isinstance(function, dict):
+        raw_call = function
+
+    name = raw_call.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    return _tool_call_payload(name, raw_call.get("arguments"))
+
+
+def _recover_bare_arguments(
+    payload: Dict[str, Any], bridge: ToolBridge
+) -> Optional[Dict[str, Any]]:
+    """Treat a bare object as the arguments of the single forced tool.
+
+    Only when it actually looks like those arguments: a refusal or an error
+    payload that happens to be JSON must not become a fabricated tool call.
+    """
+    single = bridge.single_tool
+    if single is None or not payload:
+        return None
+
+    declared = single.parameters.get("properties")
+    if isinstance(declared, dict) and declared:
+        if not any(key in declared for key in payload):
+            logger.warning(
+                "Discarding non-envelope JSON that does not match the tool's "
+                "arguments",
+                tool=single.name,
+            )
+            return None
+
+    logger.info("Recovered bare arguments object as a tool call", tool=single.name)
+    return _tool_call_payload(single.name, payload)

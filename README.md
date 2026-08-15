@@ -144,11 +144,16 @@ arrives in `message.content`.
 The two are independent, as in the OpenAI API: `tools` constrains the calls,
 `response_format` constrains the content message. Send both and the caller's
 schema becomes the schema of the envelope's `content` slot, so the model can
-either call a tool or answer in the requested shape. Definitions from the two
-schemas are namespaced (`tool_` / `content_`) when hoisted, so a `$defs` entry
-that appears on both sides cannot collapse into one. The exception is
-`tool_choice: "required"`, which leaves no content message to constrain -
-`response_format` is then unreachable and the gateway logs a warning.
+either call a tool or answer in the requested shape. Each schema keeps its own
+`$defs` where it declared them - local `$ref`s (including `#` root recursion)
+are rebased onto the embedding site - so two schemas that define the same name
+cannot collide. The exception is `tool_choice: "required"`, which leaves no
+content message to constrain: `response_format` is then unreachable and the
+gateway logs a warning.
+
+Known limitation: only the last user message reaches the CLI, so a tool *result*
+posted back as a `role: "tool"` message is dropped. One-shot tool calling works;
+multi-turn agent loops that feed results back do not.
 
 ## Configuration
 

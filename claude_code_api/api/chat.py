@@ -701,6 +701,7 @@ async def _collect_non_streaming_response(
     project_id: str,
     prefer_result_content: bool = False,
     tool_bridge: Optional[ToolBridge] = None,
+    suppress_internal_tools: bool = False,
 ) -> Dict[str, Any]:
     messages, parser = await _gather_claude_messages(claude_process)
     _log_message_summary(messages)
@@ -718,6 +719,7 @@ async def _collect_non_streaming_response(
         project_id,
         prefer_result_content=prefer_result_content,
         tool_bridge=tool_bridge,
+        suppress_internal_tools=suppress_internal_tools,
     )
     _log_response_payload(response)
     return response
@@ -790,6 +792,7 @@ def _build_non_streaming_response(
     project_id: str,
     prefer_result_content: bool = False,
     tool_bridge: Optional[ToolBridge] = None,
+    suppress_internal_tools: bool = False,
 ) -> Dict[str, Any]:
     response = create_non_streaming_response(
         messages=messages,
@@ -798,6 +801,7 @@ def _build_non_streaming_response(
         usage=usage_summary,
         prefer_result_content=prefer_result_content,
         tool_bridge=tool_bridge,
+        suppress_internal_tools=suppress_internal_tools,
     )
     response["project_id"] = project_id
     return response
@@ -1013,6 +1017,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                     claude_process,
                     prefer_result_content=json_schema is not None,
                     tool_bridge=tool_bridge,
+                    suppress_internal_tools=bool(request.tools),
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -1032,6 +1037,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
             project_id=project_id,
             prefer_result_content=json_schema is not None,
             tool_bridge=tool_bridge,
+            suppress_internal_tools=bool(request.tools),
         )
 
     except HTTPException:

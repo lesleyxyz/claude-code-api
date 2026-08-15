@@ -47,6 +47,7 @@ class ClaudeProcess:
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
         json_schema: Optional[Dict[str, Any]] = None,
+        effort: Optional[str] = None,
     ) -> bool:
         """Start Claude Code process and wait for completion."""
         self.last_error = None
@@ -60,6 +61,11 @@ class ClaudeProcess:
 
             if model:
                 cmd.extend(["--model", model])
+
+            # Truthiness, not `is not None`: an empty value would otherwise
+            # leave a dangling --effort that swallows the next flag.
+            if effort:
+                cmd.extend(["--effort", effort])
 
             if json_schema is not None:
                 cmd.extend(["--json-schema", json.dumps(json_schema)])
@@ -80,6 +86,7 @@ class ClaudeProcess:
                 session_id=self.session_id,
                 project_path=self.project_path,
                 model=model or get_default_model(),
+                effort=effort or "<cli-default>",
             )
 
             # Start process from src directory (where Claude works without API key)
@@ -446,6 +453,7 @@ class ClaudeManager:
         system_prompt: Optional[str],
         on_cli_session_id: Optional[Callable[[str], None]],
         json_schema: Optional[Dict[str, Any]] = None,
+        effort: Optional[str] = None,
     ) -> ClaudeProcess:
         model_candidates = self._build_model_candidates(selected_model)
         last_error = "Failed to start Claude process"
@@ -463,6 +471,8 @@ class ClaudeManager:
             }
             if json_schema is not None:
                 start_kwargs["json_schema"] = json_schema
+            if effort is not None:
+                start_kwargs["effort"] = effort
             success = await process.start(**start_kwargs)
 
             if success:
@@ -512,6 +522,7 @@ class ClaudeManager:
         system_prompt: Optional[str] = None,
         on_cli_session_id: Optional[Callable[[str], None]] = None,
         json_schema: Optional[Dict[str, Any]] = None,
+        effort: Optional[str] = None,
     ) -> ClaudeProcess:
         """Create new Claude session."""
         async with self._session_lock:
@@ -526,6 +537,7 @@ class ClaudeManager:
                 system_prompt=system_prompt,
                 on_cli_session_id=on_cli_session_id,
                 json_schema=json_schema,
+                effort=effort,
             )
 
     async def _stop_session_locked(self, session_id: str) -> None:

@@ -18,5 +18,6 @@ def test_openapi_chat_completions_schema(test_client):
     components = schema.get("components", {}).get("schemas", {})
     assert "ChatMessage" in components
     assert "tool_calls" in components["ChatMessage"]["properties"]
+    assert "reasoning_effort" in components["ChatCompletionRequest"]["properties"]
     assert "ChatCompletionChunkDelta" in components
     assert "tool_calls" in components["ChatCompletionChunkDelta"]["properties"]

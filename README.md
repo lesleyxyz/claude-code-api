@@ -5,6 +5,7 @@ This is a fork based on codingworkflow's claude-code-api with the following addi
 - Support for json_schema
 - Support for function tools
 - Support for `/v1/responses` API
+- Support for reasoning/effort levels using both OpenAI/Anthropic enums
 - Daily docker builds for vulnerabilities at `ghcr.io/lesleyxyz/claude-code-api:latest`
 - Latest Anthropic models
 

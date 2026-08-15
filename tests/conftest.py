@@ -19,6 +19,11 @@ from tests.model_utils import get_test_model_id
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
+# The mock CLI appends one JSON array per invocation here; see the `cli_argv`
+# fixture. Nothing asserts on the real CLI's argv, so this is the only way to
+# check that a request-level flag actually reaches the binary.
+CLI_ARGV_LOG_NAME = "claude_argv.jsonl"
+
 
 def _serialize_fixture_rules(fixture_rules, fixtures_dir: Path):
     serialized_rules = []
@@ -41,6 +46,7 @@ def _create_mock_claude_binary(
     default_fixture: Path,
     fixture_rules,
     fixtures_dir: Path,
+    argv_log: Path,
 ) -> str:
     """Create a mock Claude CLI launcher that works on POSIX and Windows."""
     serialized_rules = _serialize_fixture_rules(fixture_rules, fixtures_dir)
@@ -48,10 +54,19 @@ def _create_mock_claude_binary(
     runner_code = "\n".join(
         [
             "#!/usr/bin/env python3",
+            "import json",
             "import sys",
             "",
             f"DEFAULT_FIXTURE = {str(default_fixture)!r}",
             f"FIXTURE_RULES = {serialized_rules!r}",
+            f"ARGV_LOG = {str(argv_log)!r}",
+            "",
+            "def _record(args):",
+            "    try:",
+            "        with open(ARGV_LOG, 'a', encoding='utf-8') as handle:",
+            "            handle.write(json.dumps(args) + '\\n')",
+            "    except OSError:",
+            "        pass",
             "",
             "def _extract_prompt(args):",
             "    for idx, value in enumerate(args):",
@@ -72,6 +87,7 @@ def _create_mock_claude_binary(
             "    if args and args[0] == '--version':",
             "        print('Claude Code 1.0.0')",
             "        return 0",
+            "    _record(args)",
             "    prompt = _extract_prompt(args)",
             "    fixture_path = _resolve_fixture(prompt)",
             "    with open(fixture_path, 'r', encoding='utf-8') as handle:",
@@ -146,6 +162,7 @@ def setup_test_environment():
             default_fixture=default_fixture,
             fixture_rules=fixture_rules,
             fixtures_dir=fixtures_dir,
+            argv_log=Path(temp_dir) / CLI_ARGV_LOG_NAME,
         )
     else:
         # Ensure the real binary is available when requested
@@ -175,6 +192,27 @@ def setup_test_environment():
     for key, value in original_settings.items():
         if value is not None:
             setattr(settings, key, value)
+
+
+@pytest.fixture
+def cli_argv(setup_test_environment):
+    """Return a callable giving the argv of each mock-CLI run in this test."""
+    if os.environ.get("CLAUDE_CODE_API_USE_REAL_CLAUDE") == "1":
+        pytest.skip("argv recording requires the fixture CLI")
+
+    log_path = Path(setup_test_environment) / CLI_ARGV_LOG_NAME
+    log_path.write_text("", encoding="utf-8")  # isolate this test
+
+    def _read():
+        if not log_path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    return _read
 
 
 @pytest.fixture

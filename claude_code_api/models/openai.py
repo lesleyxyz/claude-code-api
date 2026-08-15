@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
+from claude_code_api.utils.effort import REASONING_EFFORT_VALUES
+
 OBJECT_TYPE_DESC = "Object type"
 
 
@@ -199,6 +201,17 @@ class ChatCompletionRequest(BaseModel):
             "json_schema.schema to get CLI-validated structured output via --json-schema."
         ),
     )
+    reasoning_effort: Optional[str] = Field(
+        None,
+        description=(
+            "How much reasoning effort to spend, mapped onto the CLI's --effort "
+            "flag. OpenAI's 'none'/'minimal' map to 'low' (the CLI has no lower "
+            "level); 'low'/'medium'/'high' pass through; the Claude-only levels "
+            "'xhigh' and 'max' are also accepted. Case-insensitive. Omit for the "
+            "CLI default."
+        ),
+        json_schema_extra={"enum": list(REASONING_EFFORT_VALUES)},
+    )
 
     # Extension fields for Claude Code
     project_id: Optional[str] = Field(
@@ -257,6 +270,19 @@ class ChatCompletionResponse(BaseModel):
     )
 
 
+class Reasoning(BaseModel):
+    """Responses API reasoning configuration. Only `effort` is honoured."""
+
+    effort: Optional[str] = Field(
+        None,
+        description="Reasoning effort; see ChatCompletionRequest.reasoning_effort.",
+        json_schema_extra={"enum": list(REASONING_EFFORT_VALUES)},
+    )
+    summary: Optional[str] = Field(
+        None, description="Accepted for compatibility and ignored."
+    )
+
+
 class ResponsesCreateRequest(BaseModel):
     """Minimal OpenAI Responses API request model."""
 
@@ -274,6 +300,9 @@ class ResponsesCreateRequest(BaseModel):
         False, description="Whether to stream response events"
     )
     instructions: Optional[str] = Field(None, description="System instructions")
+    reasoning: Optional[Reasoning] = Field(
+        None, description="Reasoning configuration (only `effort` is honoured)"
+    )
 
     # Extension fields for Claude Code
     project_id: Optional[str] = Field(

@@ -52,10 +52,13 @@ def test_decode_output_line():
     assert data["type"] == "text"
 
 
-@pytest.mark.asyncio
-async def test_claude_process_redirects_stdin_to_devnull(monkeypatch):
-    process = cm.ClaudeProcess(session_id="sess", project_path="/tmp")
-    captured_kwargs = {}
+def spawn_recorder(monkeypatch):
+    """Record the argv and kwargs `ClaudeProcess.start` would exec.
+
+    Nothing is spawned, so this is the cheap way to pin how the CLI command
+    line is built. Returns a dict with "argv" and "kwargs".
+    """
+    calls = {"argv": [], "kwargs": {}}
 
     class EmptyStream:
         async def readline(self):
@@ -72,19 +75,34 @@ async def test_claude_process_redirects_stdin_to_devnull(monkeypatch):
         async def wait(self):
             return 0
 
-    async def fake_create_subprocess_exec(*_args, **kwargs):
-        captured_kwargs.update(kwargs)
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        calls["argv"] = list(args)
+        calls["kwargs"].update(kwargs)
         return FakeProcess()
 
     async def fake_verify_startup(self):
         return True
 
-    monkeypatch.setattr(cm.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(
+        cm.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
     monkeypatch.setattr(cm.ClaudeProcess, "_verify_startup", fake_verify_startup)
+    return calls
+
+
+def flag_value(argv, flag):
+    """The value following `flag` in argv, or None when the flag is absent."""
+    return argv[argv.index(flag) + 1] if flag in argv else None
+
+
+@pytest.mark.asyncio
+async def test_claude_process_redirects_stdin_to_devnull(monkeypatch):
+    process = cm.ClaudeProcess(session_id="sess", project_path="/tmp")
+    calls = spawn_recorder(monkeypatch)
 
     try:
         assert await process.start(prompt="hello") is True
-        assert captured_kwargs["stdin"] == asyncio.subprocess.DEVNULL
+        assert calls["kwargs"]["stdin"] == asyncio.subprocess.DEVNULL
     finally:
         await process.stop()
 

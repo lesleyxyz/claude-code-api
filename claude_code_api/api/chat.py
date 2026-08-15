@@ -34,6 +34,7 @@ from claude_code_api.utils.streaming import (
     create_non_streaming_response,
     create_sse_response,
 )
+from claude_code_api.utils.effort import normalize_reasoning_effort
 from claude_code_api.utils.time import utc_timestamp
 from claude_code_api.utils.tools import ToolBridge, build_tool_bridge
 
@@ -133,6 +134,18 @@ def _extract_json_schema(request: ChatCompletionRequest) -> Optional[Dict[str, A
             "missing_json_schema",
         )
     return response_format.json_schema.schema_
+
+
+def _resolve_reasoning_effort(request: ChatCompletionRequest) -> Optional[str]:
+    """Map `reasoning_effort` onto a CLI --effort level, or None if unset.
+
+    The CLI only warns about an unknown level and then runs at its default, so
+    this is the only place a bad value can be reported back to the caller.
+    """
+    try:
+        return normalize_reasoning_effort(request.reasoning_effort)
+    except ValueError as e:
+        raise _input_error(str(e), "invalid_reasoning_effort") from e
 
 
 def _merge_system_prompt(system_prompt: Optional[str], addition: str) -> str:
@@ -330,6 +343,7 @@ def _responses_request_to_chat_request(
         project_id=request.project_id,
         session_id=request.session_id,
         system_prompt=system_prompt,
+        reasoning_effort=request.reasoning.effort if request.reasoning else None,
     )
 
 
@@ -917,6 +931,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
         stream=request.stream,
         project_id=request.project_id,
         session_id=request.session_id,
+        reasoning_effort=request.reasoning_effort,
     )
 
     try:
@@ -929,6 +944,9 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
 
         user_prompt, system_prompt = _extract_prompts(request)
         json_schema = _extract_json_schema(request)
+        # Validate before any project directory or session row is created, so a
+        # rejected request leaves nothing behind.
+        effort = _resolve_reasoning_effort(request)
         tool_bridge, json_schema, system_prompt = _apply_tool_bridge(
             request, json_schema, system_prompt
         )
@@ -960,6 +978,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                 system_prompt=system_prompt,
                 on_cli_session_id=_register_cli_session,
                 json_schema=json_schema,
+                effort=effort,
             )
         except ClaudeSessionConflictError as e:
             logger.warning(

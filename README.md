@@ -17,6 +17,26 @@ This project is a wrapper around claude-code CLI such that it does not violate A
 - Claude model aliases and fallback behavior
 - Optional `model` field: if omitted, CLI default model is used
 
+## Limitations
+
+These follow from wrapping the Claude Code CLI, which is a coding agent rather
+than a completions endpoint:
+
+- **No conversation history.** Only the last `user` message reaches the CLI.
+  Earlier turns, prior assistant replies and `role: "tool"` results are dropped,
+  so an agent loop that feeds a tool result back gets the same tool call again
+  instead of an answer.
+- **`tools` are emulated, not native.** The CLI has no caller-supplied tools, so
+  they are described in the system prompt and the reply is constrained with
+  `--json-schema`. One-shot tool calling works; combined with the point above,
+  multi-turn tool loops do not.
+- **No token-level streaming.** SSE chunks track whole assistant messages, so a
+  single-turn answer arrives as one chunk once it is finished. The CLI's
+  `--include-partial-messages` would allow finer deltas but is not wired up.
+- **Sampling parameters are ignored.** `temperature`, `top_p`, `max_tokens`,
+  `stop` and friends are accepted for compatibility; the CLI exposes no way to
+  pass them through.
+
 ## Quick Start (Linux/macOS)
 
 ```bash
@@ -150,10 +170,6 @@ are rebased onto the embedding site - so two schemas that define the same name
 cannot collide. The exception is `tool_choice: "required"`, which leaves no
 content message to constrain: `response_format` is then unreachable and the
 gateway logs a warning.
-
-Known limitation: only the last user message reaches the CLI, so a tool *result*
-posted back as a `role: "tool"` message is dropped. One-shot tool calling works;
-multi-turn agent loops that feed results back do not.
 
 ## Configuration
 

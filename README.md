@@ -36,6 +36,10 @@ than a completions endpoint:
 - **Sampling parameters are ignored.** `temperature`, `top_p`, `max_tokens`,
   `stop` and friends are accepted for compatibility; the CLI exposes no way to
   pass them through.
+- **Claude's built-in tools run on the host.** The CLI can read files and run
+  commands in the project directory, so a prompt can reach the filesystem of the
+  machine running the gateway. Treat prompts as untrusted input and isolate the
+  container accordingly.
 
 ## Quick Start (Linux/macOS)
 

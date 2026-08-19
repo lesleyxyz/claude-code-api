@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
@@ -11,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from claude_code_api.core.claude_manager import (
+    ClaudeCommandTooLongError,
     ClaudeModelNotSupportedError,
     ClaudeSessionConflictError,
     create_project_directory,
@@ -36,6 +38,7 @@ from claude_code_api.utils.streaming import (
     create_sse_response,
 )
 from claude_code_api.utils.effort import normalize_reasoning_effort
+from claude_code_api.utils.engine import ENGINE_SDK
 from claude_code_api.utils.history import (
     NoConversationTurnError,
     current_turn_text,
@@ -174,8 +177,30 @@ def _apply_tool_bridge(
     the schema of the envelope's `content` slot, so both OpenAI channels stay
     available in the same request.
     """
+    if settings.engine == ENGINE_SDK:
+        # The SDK engine gives Claude the caller's tools for real, so the
+        # envelope emulation is not just unnecessary here - running it would
+        # constrain the reply to a JSON envelope the tools no longer need.
+        return None, json_schema, system_prompt
+
     bridge = build_tool_bridge(request, content_schema=json_schema)
     if bridge is None:
+        if request.tools:
+            # The caller declared tools but the bridge was skipped, so nothing
+            # tells the CLI they exist. The model then emits a native tool_use,
+            # the CLI answers "No such tool available", and the complaint ends
+            # up as prose. Loud on purpose: it is silent otherwise.
+            logger.warning(
+                "Tools were declared but the bridge was not applied; the model "
+                "has no channel to call them",
+                tool_count=len(request.tools),
+                tool_choice=request.tool_choice,
+                reason=(
+                    "tool_choice disables tools"
+                    if request.tool_choice == "none"
+                    else "no usable tool definitions"
+                ),
+            )
         return None, json_schema, system_prompt
 
     if json_schema is not None and bridge.force_tool_call:
@@ -197,6 +222,21 @@ def _apply_tool_bridge(
         bridge.schema,
         _merge_system_prompt(system_prompt, bridge.instructions),
     )
+
+
+def _suppress_internal_tools(request: ChatCompletionRequest) -> bool:
+    """Whether tool_use blocks in the stream should be hidden from the client.
+
+    On the CLI engine they are Claude's own built-ins - an implementation
+    detail the caller never declared - and the emulated call arrives separately
+    in the envelope, so they are hidden whenever the caller sent tools.
+
+    On the SDK engine the caller's tools ARE registered with Claude, so a
+    tool_use block is exactly what the client asked for and must pass through.
+    """
+    if settings.engine == ENGINE_SDK:
+        return False
+    return bool(request.tools)
 
 
 def _extract_prompts(request: ChatCompletionRequest) -> Tuple[str, str]:
@@ -843,6 +883,41 @@ def _build_non_streaming_response(
     return response
 
 
+# Prose the model produces after the CLI answers a native tool_use with
+# "No such tool available". Under tool_choice="auto" such a reply is a valid
+# envelope, so it reaches the client as a normal answer unless it is spotted.
+_TOOL_REFUSAL_PATTERN = re.compile(
+    r"no such tool available|tool[- ]access issue|"
+    r"tools? (?:are|is) not .{0,20}available",
+    re.IGNORECASE,
+)
+
+
+def _warn_if_tools_went_unused(
+    request: ChatCompletionRequest, response: Dict[str, Any]
+) -> None:
+    """Flag a turn where tools were offered but the model answered in prose."""
+    if not request.tools:
+        return
+
+    choices = response.get("choices") or []
+    message = choices[0].get("message", {}) if choices else {}
+    if message.get("tool_calls"):
+        return
+
+    content = message.get("content") or ""
+    if not _TOOL_REFUSAL_PATTERN.search(content):
+        return
+
+    logger.warning(
+        "Model reported tools as unavailable instead of calling them; retrying "
+        'with tool_choice="required" would make the prose path unrepresentable',
+        tool_count=len(request.tools),
+        tool_choice=request.tool_choice,
+        content_preview=content[:200],
+    )
+
+
 def _log_response_payload(response: Dict[str, Any]) -> None:
     choices = response.get("choices") or []
     first_choice = choices[0] if choices else {}
@@ -992,6 +1067,10 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
             def _register_cli_session(cli_session_id: str):
                 session_manager.register_cli_session(session_id, cli_session_id)
 
+            engine_kwargs = {}
+            if settings.engine == ENGINE_SDK and request.tools:
+                engine_kwargs["client_tools"] = request.tools
+
             claude_process = await claude_manager.create_session(
                 session_id=session_id,
                 project_path=project_path,
@@ -1001,6 +1080,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                 on_cli_session_id=_register_cli_session,
                 json_schema=json_schema,
                 effort=effort,
+                **engine_kwargs,
             )
         except ClaudeSessionConflictError as e:
             logger.warning(
@@ -1013,6 +1093,18 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                 "The session is currently busy with another process.",
                 "invalid_request_error",
                 "session_busy",
+            ) from e
+        except ClaudeCommandTooLongError as e:
+            logger.warning(
+                "Request too large for the operating system command line",
+                session_id=session_id,
+                error=str(e),
+            )
+            raise _http_error(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                str(e),
+                "invalid_request_error",
+                "request_too_large",
             ) from e
         except ClaudeModelNotSupportedError as e:
             logger.warning(
@@ -1060,7 +1152,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                     claude_process,
                     prefer_result_content=json_schema is not None,
                     tool_bridge=tool_bridge,
-                    suppress_internal_tools=bool(request.tools),
+                    suppress_internal_tools=_suppress_internal_tools(request),
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -1072,7 +1164,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                 },
             )
 
-        return await _collect_non_streaming_response(
+        completion = await _collect_non_streaming_response(
             claude_process=claude_process,
             session_manager=session_manager,
             session_id=api_session_id,
@@ -1080,8 +1172,10 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
             project_id=project_id,
             prefer_result_content=json_schema is not None,
             tool_bridge=tool_bridge,
-            suppress_internal_tools=bool(request.tools),
+            suppress_internal_tools=_suppress_internal_tools(request),
         )
+        _warn_if_tools_went_unused(request, completion)
+        return completion
 
     except HTTPException:
         # Re-raise HTTP exceptions

@@ -1,6 +1,7 @@
 """Unit tests for Claude manager helpers."""
 
 import asyncio
+import errno
 import os
 import time
 import types
@@ -189,24 +190,114 @@ def prompt_dir(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_oversized_command_line_is_rejected(monkeypatch, prompt_dir):
-    """A huge inline schema fails with a clear message, not a raw OSError.
+async def test_oversized_command_line_raises_rather_than_returning_false(
+    monkeypatch, prompt_dir
+):
+    """Too-large is deterministic and caller-caused, so it propagates.
 
-    The system prompt cannot trigger this any more - it goes to a file - so
-    the remaining oversize risk is --json-schema, which is inline-only.
+    Flattening it to False would send it through the model-fallback loop,
+    which would fail identically against every model.
     """
+    if os.name != "nt":
+        pytest.skip("the pre-flight guard is Windows-only by design")
+
     process = cm.ClaudeProcess(session_id="sess", project_path="/tmp")
     spawn_recorder(monkeypatch)
-    max_total, _ = cm._argv_limits()
 
-    try:
-        started = await process.start(
-            prompt="hi", json_schema={"description": "x" * (max_total + 100)}
+    with pytest.raises(cm.ClaudeCommandTooLongError):
+        await process.start(
+            prompt="hi", system_prompt="s", json_schema={"d": "x" * 40000}
         )
-        assert started is False
-        assert "byte limit" in (process.last_error or "")
-    finally:
-        await process.stop()
+
+    # The prompt file must not survive the failure.
+    assert list(prompt_dir.iterdir()) == []
+
+
+def test_command_line_is_measured_in_utf16_units_not_bytes():
+    """Regression: measuring UTF-8 bytes rejected valid non-ASCII commands.
+
+    Windows counts UTF-16 code units. 12k CJK characters cost 12k units but
+    36k UTF-8 bytes, so a byte-based cap refused a command line the OS would
+    have run without complaint.
+    """
+    cjk = "中" * 12000
+    cmd = ["claude", "-p", "--json-schema", cjk]
+
+    assert cm.command_line_units(cmd) < 13000
+    assert len(cjk.encode("utf-8")) == 36000
+    assert cm.oversize_command_reason(cmd) is None
+
+
+def test_command_line_accounts_for_windows_quoting():
+    """Regression: a raw sum of argument lengths under-counts badly.
+
+    CPython joins argv with list2cmdline on Windows and escapes every quote;
+    JSON is quote-dense, so the real command line runs far over the sum of
+    the parts and an unquoted measure lets through commands that then fail.
+    """
+    payload = '{"a":"b","c":"d"}' * 1600
+    cmd = ["claude", "-p", "--json-schema", payload]
+
+    raw = sum(len(part) for part in cmd)
+    assert cm.command_line_units(cmd) > raw * 1.2
+
+
+def test_guard_is_windows_only():
+    """POSIX gets an exact answer from execve; a pre-check can only misfire."""
+    huge = ["claude", "-p", "--json-schema", "x" * 500_000]
+
+    if os.name == "nt":
+        assert cm.oversize_command_reason(huge) is not None
+    else:
+        assert cm.oversize_command_reason(huge) is None
+
+
+def test_os_errors_are_recognised_as_too_long():
+    too_big = OSError()
+    too_big.errno = errno.E2BIG
+    assert cm._is_command_too_long_error(too_big) is True
+
+    # Windows reports this as a FileNotFoundError that never mentions argv.
+    windows = FileNotFoundError()
+    windows.winerror = 206
+    assert cm._is_command_too_long_error(windows) is True
+
+    unrelated = OSError()
+    unrelated.errno = errno.ENOENT
+    assert cm._is_command_too_long_error(unrelated) is False
+
+
+@pytest.mark.asyncio
+async def test_spawn_e2big_is_translated(monkeypatch, prompt_dir):
+    """On POSIX nothing is pre-checked, so the OS error is the only signal."""
+    process = cm.ClaudeProcess(session_id="sess", project_path="/tmp")
+
+    async def boom(*_args, **_kwargs):
+        error = OSError("Argument list too long")
+        error.errno = errno.E2BIG
+        raise error
+
+    monkeypatch.setattr(cm.asyncio, "create_subprocess_exec", boom)
+
+    with pytest.raises(cm.ClaudeCommandTooLongError):
+        await process.start(prompt="hi", system_prompt="s")
+
+    assert list(prompt_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_unrelated_oserror_still_returns_false(monkeypatch, prompt_dir):
+    """Only E2BIG/206 is reinterpreted; everything else keeps its behaviour."""
+    process = cm.ClaudeProcess(session_id="sess", project_path="/tmp")
+
+    async def boom(*_args, **_kwargs):
+        error = OSError("no such binary")
+        error.errno = errno.ENOENT
+        raise error
+
+    monkeypatch.setattr(cm.asyncio, "create_subprocess_exec", boom)
+
+    assert await process.start(prompt="hi") is False
 
 
 @pytest.mark.asyncio
@@ -305,46 +396,6 @@ def test_sweep_removes_only_stale_prompt_files(prompt_dir, monkeypatch):
 def test_sweep_is_safe_when_the_directory_is_absent(prompt_dir):
     assert not prompt_dir.exists()
     assert cm.sweep_stale_prompt_files() == 0
-
-
-def test_argv_limits_are_platform_specific():
-    """Regression: a Windows-sized cap was once applied on Linux, where a
-    56KB command line is perfectly legal, and it broke real requests."""
-    max_total, max_single = cm._argv_limits()
-
-    if os.name == "nt":
-        assert max_total <= 32767
-    else:
-        # Comfortably above anything the tool bridge realistically produces.
-        assert max_total >= 200_000
-        assert max_single >= 120_000
-
-
-def test_a_realistic_tool_bridge_command_is_not_rejected():
-    """56KB of system prompt + schema is normal for a multi-tool request."""
-    cmd = [
-        "claude",
-        "-p",
-        "--system-prompt",
-        "x" * 50_000,
-        "--json-schema",
-        "y" * 6_000,
-    ]
-    reason = cm._oversize_reason(cmd)
-
-    if os.name == "nt":
-        assert reason is not None  # genuinely impossible on Windows
-    else:
-        assert reason is None
-
-
-def test_oversize_reason_counts_bytes_not_characters():
-    """Multi-byte UTF-8 must count as the bytes execve actually copies."""
-    max_total, _ = cm._argv_limits()
-    # Each character is 3 bytes in UTF-8, so this is over on byte count while
-    # its character count stays under the limit.
-    payload = "中" * (max_total // 2)
-    assert cm._oversize_reason(["claude", payload]) is not None
 
 
 @pytest.mark.asyncio

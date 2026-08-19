@@ -26,6 +26,7 @@ from claude_code_api.core.claude_manager import (
     sweep_stale_prompt_files,
 )
 from claude_code_api.core.config import settings
+from claude_code_api.utils.engine import ENGINE_SDK
 from claude_code_api.core.database import close_database, create_tables
 from claude_code_api.core.logging_config import configure_logging
 from claude_code_api.core.session_manager import SessionManager
@@ -47,7 +48,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Initialize managers
     app.state.session_manager = SessionManager()
-    app.state.claude_manager = ClaudeManager()
+    # One of two interchangeable engines; both expose the same surface to
+    # the API layer, so only this line differs.
+    if settings.engine == ENGINE_SDK:
+        from claude_code_api.core.sdk_session import SdkManager
+
+        app.state.claude_manager = SdkManager()
+    else:
+        app.state.claude_manager = ClaudeManager()
     logger.info("Managers initialized", lifecycle=True)
 
     # Prompt files are removed when their process ends; this only clears ones

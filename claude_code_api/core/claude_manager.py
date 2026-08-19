@@ -4,11 +4,11 @@ import asyncio
 import json
 import os
 import subprocess
-import sys
+import errno
 import time
 import uuid
 from collections import deque
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 import structlog
 
@@ -100,40 +100,46 @@ def sweep_stale_prompt_files() -> int:
     return removed
 
 
-def _argv_limits() -> Tuple[int, int]:
-    """(max total, max single argument) in BYTES for this platform.
+# CreateProcessW caps the whole command line at 32767 UTF-16 code units
+# including the terminating NUL, so 32766 is usable. This is exact and
+# constant, which is why the check below carries no margin: any margin is by
+# construction a band of command lines that Windows would run and we refuse.
+_WINDOWS_COMMAND_LINE_LIMIT = 32766
 
-    Bytes, not characters: the payload is UTF-8 JSON that routinely carries
-    non-ASCII. These are per-OS and wildly different, so a single number would
-    either reject valid Linux command lines or miss real Windows failures.
+
+def command_line_units(cmd: List[str]) -> int:
+    """Length of `cmd` as Windows will actually see it, in UTF-16 code units.
+
+    Two things make the naive sum wrong, in opposite directions:
+
+    * Windows counts UTF-16 code units, not UTF-8 bytes. Measuring bytes
+      rejects non-ASCII command lines the OS would happily run - a schema full
+      of CJK descriptions triples in "size" while its real cost is unchanged.
+    * CPython does not hand Windows an argv. It joins the list with
+      `list2cmdline` and passes one string, escaping every embedded quote.
+      JSON is quote-dense, so the real command line runs well over the sum of
+      the parts and a raw sum lets through lines that then fail to spawn.
     """
-    if os.name == "nt":
-        # CreateProcess caps the whole command line at 32767 characters,
-        # including the quoting subprocess adds around each argument.
-        return 31000, 31000
-    if sys.platform == "darwin":
-        # ARG_MAX is 256 KiB and covers argv plus the environment block.
-        return 200_000, 200_000
-    # Linux: MAX_ARG_STRLEN caps a *single* argument at 128 KiB, while ARG_MAX
-    # (argv plus environment) is typically 2 MiB. Leave room for the env.
-    return 1_000_000, 120_000
+    return len(subprocess.list2cmdline(cmd).encode("utf-16-le")) // 2
 
 
-def _oversize_reason(cmd: List[str]) -> Optional[str]:
-    """Why the OS would refuse to spawn this command, or None if it would not."""
-    max_total, max_single = _argv_limits()
-    sizes = [len(part.encode("utf-8")) for part in cmd]
-    # One extra byte per argument for the separator/terminator.
-    total = sum(sizes) + len(sizes)
+def oversize_command_reason(cmd: List[str]) -> Optional[str]:
+    """Why Windows would refuse to spawn `cmd`, or None.
 
-    if total > max_total:
-        return f"the command line is {total} bytes, over the {max_total} byte limit"
+    Deliberately Windows-only. On POSIX `execve` reports E2BIG exactly, for
+    free, against the real budget - which depends on the inherited
+    environment, RLIMIT_STACK, page size and the pointer arrays, none of which
+    are knowable here. A pre-check there could only ever reject something the
+    kernel would have run, which is exactly the bug this replaces.
+    """
+    if os.name != "nt":
+        return None
 
-    largest = max(sizes, default=0)
-    if largest > max_single:
+    units = command_line_units(cmd)
+    if units > _WINDOWS_COMMAND_LINE_LIMIT:
         return (
-            f"one argument is {largest} bytes, over the "
-            f"{max_single} byte per-argument limit"
+            f"the Windows command line is {units} UTF-16 units, over the "
+            f"{_WINDOWS_COMMAND_LINE_LIMIT} limit"
         )
     return None
 
@@ -150,6 +156,18 @@ def _redact_command(cmd: List[str]) -> List[str]:
         safe_cmd.append(part)
         redact_next = part in _SECRET_VALUE_FLAGS
     return safe_cmd
+
+
+def _is_command_too_long_error(error: OSError) -> bool:
+    """Whether an OSError from spawning means the command line was too long.
+
+    POSIX raises E2BIG. Windows raises FileNotFoundError with winerror 206
+    ("The filename or extension is too long") and says nothing about
+    arguments, so nobody connects it to a tool schema without this.
+    """
+    return getattr(error, "errno", None) == errno.E2BIG or (
+        getattr(error, "winerror", None) == 206
+    )
 
 
 class ClaudeProcess:
@@ -238,13 +256,13 @@ class ClaudeProcess:
 
             # Start process from src directory (where Claude works without API key)
             src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            oversize = _oversize_reason(cmd)
+            oversize = oversize_command_reason(cmd)
             if oversize:
-                raise ClaudeProcessStartError(
-                    f"Claude cannot be started on {sys.platform} because "
-                    f"{oversize}. This is nearly always an oversized system "
-                    "prompt or tool schema: reduce the number of tools or the "
-                    "size of their JSON Schemas."
+                raise ClaudeCommandTooLongError(
+                    f"Cannot start Claude: {oversize}. The system prompt is "
+                    "already passed as a file, so this is the inline "
+                    "--json-schema: reduce the size of the tool schemas or the "
+                    "number of tools in the request."
                 )
 
             safe_cmd = _redact_command(cmd)
@@ -252,13 +270,24 @@ class ClaudeProcess:
             logger.info(f"Command: {' '.join(safe_cmd)}")
 
             # Start process asynchronously
-            self.process = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=src_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.PIPE,
-            )
+            try:
+                self.process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=src_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.PIPE,
+                )
+            except OSError as e:
+                if not _is_command_too_long_error(e):
+                    raise
+                # The only backstop on POSIX, where nothing is pre-checked.
+                raise ClaudeCommandTooLongError(
+                    "Cannot start Claude: the operating system refused the "
+                    "command line as too long. The system prompt is already "
+                    "passed as a file, so this is the inline --json-schema: "
+                    "reduce the size or number of tool schemas."
+                ) from e
 
             self.is_running = True
 
@@ -277,6 +306,12 @@ class ClaudeProcess:
 
             return True
 
+        except ClaudeCommandTooLongError:
+            # Deterministic and caller-caused: retrying it against a different
+            # model would fail identically, so it propagates instead of being
+            # flattened to False. stop() still releases the prompt file.
+            await self.stop()
+            raise
         except Exception as e:
             self.last_error = str(e)
             await self.stop()
@@ -507,6 +542,15 @@ class ClaudeConcurrencyError(ClaudeManagerError):
 
 class ClaudeProcessStartError(ClaudeManagerError):
     """Raised when a Claude process fails to start."""
+
+
+class ClaudeCommandTooLongError(ClaudeManagerError):
+    """Raised when the request cannot fit on the operating system's argv.
+
+    Distinct from ClaudeProcessStartError because it is deterministic and
+    caused by the request, not by the service being unavailable: it maps to
+    413, and retrying it - against another model or otherwise - is pointless.
+    """
 
 
 class ClaudeSessionConflictError(ClaudeManagerError):

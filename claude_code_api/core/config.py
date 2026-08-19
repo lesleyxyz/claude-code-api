@@ -8,6 +8,7 @@ from typing import List
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from claude_code_api.utils.engine import ENGINE_CLI, normalize_engine
 from claude_code_api.utils.history import (
     HISTORY_MODE_FLATTEN,
     normalize_history_mode,
@@ -166,6 +167,15 @@ class Settings(BaseSettings):
     default_model: str = "claude-sonnet-4-5-20250929"
     max_concurrent_sessions: int = 10
     session_timeout_minutes: int = 30
+
+    # Engine backing the API.
+    # cli - spawn `claude -p` per request and parse stream-json
+    # sdk - drive the Claude Agent SDK in-process, with native tools
+    engine: str = ENGINE_CLI
+
+    @field_validator("engine", mode="before")
+    def parse_engine(cls, v):
+        return normalize_engine(v)
 
     # Conversation history
     # off      - last user message only (behaviour before history existed)

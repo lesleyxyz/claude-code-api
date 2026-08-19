@@ -1595,6 +1595,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                     claude_process,
                     prefer_result_content=json_schema is not None,
                     tool_bridge=tool_bridge,
+                    hold_text_for_tool_calls=bool(request.tools),
                     suppress_internal_tools=_suppress_internal_tools(
                         request, json_schema
                     ),

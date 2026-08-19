@@ -67,6 +67,7 @@ class OpenAIStreamConverter:
         prefer_result_content: bool = False,
         tool_bridge: Optional[ToolBridge] = None,
         suppress_internal_tools: bool = False,
+        hold_text_for_tool_calls: bool = False,
     ):
         self.model = model
         self.session_id = session_id
@@ -75,6 +76,13 @@ class OpenAIStreamConverter:
         self.chunk_index = 0
         self.parser = ClaudeOutputParser()
         self.tool_call_index = 0
+        # Whether assistant text waits for the turn to declare itself. Claude
+        # can narrate ("I'll roll the dice") in one message and call the tool in
+        # the next, and a stream cannot retract what it has already sent - so
+        # when the caller declared tools, text is held until it is clear whether
+        # it is the answer or a preface to a call.
+        self.hold_text_for_tool_calls = hold_text_for_tool_calls
+        self._held_text_chunks: List[str] = []
         self.prefer_result_content = prefer_result_content
         self.tool_bridge = tool_bridge
         # Decided by the caller, which knows which engine ran: on the CLI
@@ -112,32 +120,48 @@ class OpenAIStreamConverter:
         saw_text = False
         saw_tool_calls = False
 
+        # Tool calls are read first because they decide whether this message's
+        # text is an answer or narration in front of a call. A stream cannot
+        # retract text it has already sent, so the choice has to be made here,
+        # while both halves of the message are in hand.
+        tool_uses = (
+            self.parser.extract_tool_uses(message)
+            if not self.suppress_internal_tools
+            else []
+        )
+
         # In schema mode, the final `result` payload is the sole authoritative
         # content; skip incremental assistant text so clients don't receive it
         # concatenated with the schema-validated result.
-        if not self.prefer_result_content:
+        if not self.prefer_result_content and not tool_uses:
             text_content = self.parser.extract_text_content(message).strip()
             if text_content:
-                chunks.append(
-                    SSEFormatter.format_event(
-                        self._build_chunk({"content": text_content})
-                    )
+                event = SSEFormatter.format_event(
+                    self._build_chunk({"content": text_content})
                 )
+                if self.hold_text_for_tool_calls:
+                    self._held_text_chunks.append(event)
+                else:
+                    chunks.append(event)
                 saw_text = True
 
         # Claude's own built-in tools are an implementation detail. Leaking them
         # would hand the client tool calls it never declared - and a client that
-        # sent tool_choice:"none" asked for none at all.
-        if not self.suppress_internal_tools:
-            tool_uses = self.parser.extract_tool_uses(message)
-            if tool_uses:
-                tool_calls = self._build_tool_calls(tool_uses)
-                chunks.append(
-                    SSEFormatter.format_event(
-                        self._build_chunk({"tool_calls": tool_calls})
-                    )
+        # sent tool_choice:"none" asked for none at all. `tool_uses` is already
+        # empty in that case.
+        if tool_uses:
+            if self._held_text_chunks:
+                logger.info(
+                    "Dropping held narration that preceded a tool call",
+                    session_id=self.session_id,
+                    dropped_chunks=len(self._held_text_chunks),
                 )
-                saw_tool_calls = True
+                self._held_text_chunks.clear()
+            tool_calls = self._build_tool_calls(tool_uses)
+            chunks.append(
+                SSEFormatter.format_event(self._build_chunk({"tool_calls": tool_calls}))
+            )
+            saw_tool_calls = True
 
         return chunks, saw_text, saw_tool_calls
 
@@ -207,6 +231,13 @@ class OpenAIStreamConverter:
                     saw_tool_calls = saw_tool_calls or saw_tools
                     break
 
+            # The turn is over: nothing held back can be narration any more,
+            # so it is the answer and goes out now.
+            if self._held_text_chunks and not saw_tool_calls:
+                for chunk in self._held_text_chunks:
+                    yield chunk
+            self._held_text_chunks.clear()
+
             # Send final chunk
             finish_reason = "tool_calls" if saw_tool_calls else "stop"
             yield SSEFormatter.format_event(
@@ -242,6 +273,7 @@ class StreamingManager:
         prefer_result_content: bool = False,
         tool_bridge: Optional[ToolBridge] = None,
         suppress_internal_tools: bool = False,
+        hold_text_for_tool_calls: bool = False,
     ) -> AsyncGenerator[str, None]:
         """Create new streaming connection."""
         converter = OpenAIStreamConverter(
@@ -250,6 +282,7 @@ class StreamingManager:
             prefer_result_content=prefer_result_content,
             tool_bridge=tool_bridge,
             suppress_internal_tools=suppress_internal_tools,
+            hold_text_for_tool_calls=hold_text_for_tool_calls,
         )
         heartbeat_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
         self.active_streams[session_id] = StreamState(
@@ -403,6 +436,7 @@ async def create_sse_response(
     prefer_result_content: bool = False,
     tool_bridge: Optional[ToolBridge] = None,
     suppress_internal_tools: bool = False,
+    hold_text_for_tool_calls: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Create SSE response for Claude Code output."""
     try:
@@ -413,6 +447,7 @@ async def create_sse_response(
             prefer_result_content=prefer_result_content,
             tool_bridge=tool_bridge,
             suppress_internal_tools=suppress_internal_tools,
+            hold_text_for_tool_calls=hold_text_for_tool_calls,
         ):
             yield chunk
     except Exception as e:
@@ -545,6 +580,20 @@ def create_non_streaming_response(
         usage = OpenAIConverter.calculate_usage(parser)
 
     finish_reason = "tool_calls" if tool_calls else "stop"
+
+    if tool_calls and complete_content:
+        # A turn that calls a tool answers with the call. Claude often prefixes
+        # one with a line of narration ("I'll roll the dice for you"), which
+        # OpenAI's models do not: they return content null alongside tool_calls.
+        # Clients are built for that shape, and an agent that reads the text
+        # first takes the narration for the final answer and never runs the
+        # tool - so the narration is dropped rather than shipped.
+        logger.info(
+            "Dropping narration that accompanied a tool call",
+            tool_call_count=len(tool_calls),
+            dropped_chars=len(complete_content),
+        )
+        complete_content = ""
 
     message_payload: Dict[str, Any] = {
         "role": "assistant",

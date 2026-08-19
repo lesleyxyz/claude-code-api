@@ -8,7 +8,7 @@ from typing import List
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from claude_code_api.utils.engine import ENGINE_CLI, normalize_engine
+from claude_code_api.utils.engine import ENGINE_SDK, normalize_engine
 from claude_code_api.utils.history import (
     HISTORY_MODE_FLATTEN,
     normalize_history_mode,
@@ -171,7 +171,7 @@ class Settings(BaseSettings):
     # Engine backing the API.
     # cli - spawn `claude -p` per request and parse stream-json
     # sdk - drive the Claude Agent SDK in-process, with native tools
-    engine: str = ENGINE_CLI
+    engine: str = ENGINE_SDK
 
     @field_validator("engine", mode="before")
     def parse_engine(cls, v):

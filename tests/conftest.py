@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from httpx import AsyncClient
 
 from claude_code_api.core.config import settings
+from claude_code_api.utils.engine import ENGINE_CLI
 from claude_code_api.utils.history import CURRENT_TURN_OPEN
 
 # Now import the app and configuration
@@ -159,11 +160,18 @@ def setup_test_environment():
         "database_url": getattr(settings, "database_url", "sqlite:///./test.db"),
         "debug": getattr(settings, "debug", False),
         "session_map_path": getattr(settings, "session_map_path", None),
+        "engine": getattr(settings, "engine", None),
     }
 
     # Set test settings
     settings.project_root = os.path.join(temp_dir, "projects")
     settings.require_auth = False
+    # Pin the CLI engine for the deterministic suite. The mock binary below
+    # speaks the CLI's argv/stdin protocol, not the stream-json control
+    # protocol the SDK uses, so leaving this on the default would quietly
+    # send the whole suite to the real Claude. The SDK engine is covered by
+    # tests/test_sdk_engine.py, which builds SDK objects directly.
+    settings.engine = ENGINE_CLI
 
     # Prefer deterministic fixtures unless explicitly using real Claude
     use_real_claude = os.environ.get("CLAUDE_CODE_API_USE_REAL_CLAUDE") == "1"

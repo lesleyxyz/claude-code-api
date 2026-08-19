@@ -66,9 +66,9 @@ class TestNormalizeEngine:
     @pytest.mark.parametrize(
         "value,expected",
         [
-            (None, ENGINE_CLI),
-            ("", ENGINE_CLI),
-            ("  ", ENGINE_CLI),
+            (None, ENGINE_SDK),
+            ("", ENGINE_SDK),
+            ("  ", ENGINE_SDK),
             ("CLI", ENGINE_CLI),
             (" sdk ", ENGINE_SDK),
         ],
@@ -80,9 +80,12 @@ class TestNormalizeEngine:
         with pytest.raises(ValueError, match="Supported values"):
             normalize_engine("grpc")
 
-    def test_default_is_the_cli_engine(self):
-        """The SDK engine is opt-in; the CLI path stays the default."""
-        assert Settings().engine == ENGINE_CLI
+    def test_default_is_the_sdk_engine(self):
+        """Native tools are the default; the CLI engine is the fallback."""
+        assert Settings().engine == ENGINE_SDK
+
+    def test_cli_engine_remains_reachable(self):
+        assert Settings(engine="cli").engine == ENGINE_CLI
 
     def test_settings_reject_a_bad_engine(self):
         with pytest.raises(Exception):

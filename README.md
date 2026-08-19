@@ -5,7 +5,7 @@ This is a fork based on codingworkflow's claude-code-api with the following addi
 - Support for json_schema
 - Support for function tools
 - Support for multi-turn conversation history, including agent tool loops
-- Optional Claude Agent SDK engine (`ENGINE=sdk`) with native tool calling
+- Native tool calling via the Claude Agent SDK engine (default; `ENGINE=cli` for the old path)
 - Support for `/v1/responses` API
 - Support for reasoning/effort levels using both OpenAI/Anthropic enums
 - Daily docker builds for vulnerabilities at `ghcr.io/lesleyxyz/claude-code-api:latest`
@@ -202,10 +202,11 @@ Engine:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ENGINE` | `cli` | `cli` spawns `claude -p` per request and parses stream-json. `sdk` drives the Claude Agent SDK in-process. |
+| `ENGINE` | `sdk` | `sdk` drives the Claude Agent SDK in-process, with native tool calling. `cli` spawns `claude -p` per request and parses stream-json, emulating tools with a JSON envelope. |
 
-The `sdk` engine registers the caller's `tools` with Claude as real in-process
-MCP tools instead of emulating them, which removes the envelope entirely:
+The `sdk` engine is the default. It registers the caller's `tools` with Claude
+as real in-process MCP tools instead of emulating them, which removes the
+envelope entirely:
 
 - a tool call arrives as a genuine tool use, so the model cannot fail to find a
   tool that is actually in its toolset;

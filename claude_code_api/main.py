@@ -5,7 +5,6 @@ A FastAPI-based service that provides OpenAI-compatible endpoints
 while leveraging Claude Code's powerful workflow capabilities.
 """
 
-import asyncio
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -21,14 +20,10 @@ from claude_code_api.api.models import router as models_router
 from claude_code_api.api.projects import router as projects_router
 from claude_code_api.api.sessions import router as sessions_router
 from claude_code_api.core.auth import auth_middleware
-from claude_code_api.core.claude_manager import (
-    ClaudeManager,
-    sweep_stale_prompt_files,
-)
 from claude_code_api.core.config import settings
-from claude_code_api.utils.engine import ENGINE_SDK
 from claude_code_api.core.database import close_database, create_tables
 from claude_code_api.core.logging_config import configure_logging
+from claude_code_api.core.sdk_session import SdkManager
 from claude_code_api.core.session_manager import SessionManager
 from claude_code_api.models.openai import ChatCompletionChunk
 
@@ -48,19 +43,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Initialize managers
     app.state.session_manager = SessionManager()
-    # One of two interchangeable engines; both expose the same surface to
-    # the API layer, so only this line differs.
-    if settings.engine == ENGINE_SDK:
-        from claude_code_api.core.sdk_session import SdkManager
-
-        app.state.claude_manager = SdkManager()
-    else:
-        app.state.claude_manager = ClaudeManager()
+    app.state.claude_manager = SdkManager()
     logger.info("Managers initialized", lifecycle=True)
-
-    # Prompt files are removed when their process ends; this only clears ones
-    # orphaned by a hard crash, so the scratch directory cannot grow forever.
-    await asyncio.to_thread(sweep_stale_prompt_files)
 
     # Verify Claude Code availability
     try:
@@ -70,7 +54,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.error("Claude Code not available", error=str(e))
         raise HTTPException(
             status_code=503,
-            detail="Claude Code CLI not available. Please ensure Claude Code is installed and accessible.",
+            detail=(
+                "Claude Code is not available. Ensure the Claude Code binary "
+                "and the Agent SDK are installed and accessible."
+            ),
         )
 
     yield

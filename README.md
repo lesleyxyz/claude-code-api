@@ -5,7 +5,7 @@ This is a fork based on codingworkflow's claude-code-api with the following addi
 - Support for json_schema
 - Support for function tools
 - Support for multi-turn conversation history, including agent tool loops
-- Native tool calling via the Claude Agent SDK engine (default; `ENGINE=cli` for the old path)
+- Native tool calling via the Claude Agent SDK
 - Support for `/v1/responses` API
 - Support for reasoning/effort levels using both OpenAI/Anthropic enums
 - Daily docker builds for vulnerabilities at `ghcr.io/lesleyxyz/claude-code-api:latest`
@@ -22,20 +22,9 @@ This project is a wrapper around claude-code CLI such that it does not violate A
 
 ## Limitations
 
-These follow from wrapping the Claude Code CLI, which is a coding agent rather
+These follow from wrapping the Claude Code CLI/Agent SDK, which is a coding agent rather
 than a completions endpoint:
 
-- **Conversation history is replayed, not resumed.** The CLI takes a single
-  prompt, so the whole message array is rendered into it on every request and
-  the client stays the source of truth (as OpenAI clients expect). Multi-turn
-  requests therefore cost more input tokens than a native chat endpoint, and
-  very long conversations are truncated oldest-first. Controlled by
-  `CONVERSATION_HISTORY`; set it to `off` for the old last-message-only
-  behaviour. A single-message request is unaffected either way.
-- **`tools` are emulated, not native.** The CLI has no caller-supplied tools, so
-  they are described in the system prompt and the reply is constrained with
-  `--json-schema`. Note that `tool_calls[].function.arguments` must be a JSON
-  *string*, as in the OpenAI schema; sending an object gets a 422.
 - **No token-level streaming.** SSE chunks track whole assistant messages, so a
   single-turn answer arrives as one chunk once it is finished. The CLI's
   `--include-partial-messages` would allow finer deltas but is not wired up.
@@ -146,14 +135,6 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-The Claude CLI has no notion of caller-supplied tools, so `tools` is emulated on
-top of its `--json-schema` support: the declared tools are described in the
-system prompt, output is constrained to a `{content, tool_calls}` envelope, and
-the validated JSON is unpacked into standard OpenAI `tool_calls`. `tool_choice`
-accepts `none`, `auto` (default), `required`/`any`, or a named function, and
-`parallel_tool_calls: false` caps the response at one call. Claude's own
-built-in tools are never surfaced as `tool_calls`.
-
 Structured output:
 
 ```bash
@@ -167,19 +148,6 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     }
   }'
 ```
-
-The schema is passed to the CLI's `--json-schema` flag and the validated JSON
-arrives in `message.content`.
-
-The two are independent, as in the OpenAI API: `tools` constrains the calls,
-`response_format` constrains the content message. Send both and the caller's
-schema becomes the schema of the envelope's `content` slot, so the model can
-either call a tool or answer in the requested shape. Each schema keeps its own
-`$defs` where it declared them - local `$ref`s (including `#` root recursion)
-are rebased onto the embedding site - so two schemas that define the same name
-cannot collide. The exception is `tool_choice: "required"`, which leaves no
-content message to constrain: `response_format` is then unreachable and the
-gateway logs a warning.
 
 ## Configuration
 
@@ -195,33 +163,38 @@ Conversation history:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CONVERSATION_HISTORY` | `flatten` | `off` sends only the last user message. `flatten` renders the whole array into the prompt every turn. `resume` continues the Claude session and sends only the new messages (SDK engine only). |
+| `CONVERSATION_HISTORY` | `flatten` | `off` sends only the last user message. `flatten` renders the whole array into the prompt every turn. `resume` continues the Claude session and sends only the new messages. |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `200000` | Cap on the rendered history. Oldest messages are dropped first and the prompt says so; the newest turn is never truncated. `0` disables the cap. |
 
-Engine:
+### The Claude Agent SDK engine
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `ENGINE` | `sdk` | `sdk` drives the Claude Agent SDK in-process, with native tool calling. `cli` spawns `claude -p` per request and parses stream-json, emulating tools with a JSON envelope. |
-
-The `sdk` engine is the default. It registers the caller's `tools` with Claude
-as real in-process MCP tools instead of emulating them, which removes the
-envelope entirely:
+The server runs entirely on the Claude Agent SDK, in-process - there is no
+`claude -p` subprocess and no CLI-emulation path. The caller's `tools` are
+registered with Claude as real in-process MCP tools rather than emulated with
+a JSON envelope:
 
 - a tool call arrives as a genuine tool use, so the model cannot fail to find a
   tool that is actually in its toolset;
 - each tool keeps its own JSON Schema, instead of collapsing to
   `additionalProperties: true` once there is more than one tool;
-- tool schemas no longer sit in the system prompt (10 n8n-sized tools cost about
-  56,000 characters there on the `cli` engine);
-- `tools` and `response_format` become independent channels, so a request can
-  get a tool call on one turn and a schema-conformant answer on the next. On the
-  `cli` engine the two compete for the same envelope and `response_format` is
-  dropped when a tool call is forced.
+- tool schemas never sit in the system prompt, so a large toolset costs nothing
+  there;
+- `tools` and `response_format` are independent channels, so a request can get
+  a tool call on one turn and a schema-conformant answer on the next.
 
-Claude's own built-in tools are switched off on this engine, so only the
-caller's tools can run. Streaming, `/v1/responses`, `response_format`,
-conversation history and reasoning effort all work on both engines.
+Claude's own built-in tools are switched off, so only the caller's tools can
+run. Streaming, `/v1/responses`, `response_format`, conversation history and
+reasoning effort are all supported.
+
+`tool_choice` has no SDK equivalent - there is no way to oblige the model to
+reach for a tool it was offered - so a demand for one is stated in the system
+prompt instead, and a turn that ends without the call is retried in the same
+session:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SDK_REQUIRED_TOOL_ATTEMPTS` | `2` | Extra follow-up messages a session gets, in the same conversation, when `tool_choice` demanded a call and the model answered without making it. `0` disables retrying. The final attempt is released to the caller either way - as a tool call if it made one, otherwise as whatever the model said - rather than the caller getting an empty reply. |
+| `SDK_ISOLATE_SETTINGS` | `true` | Whether the engine runs isolated from this host's own Claude Code config: no `~/.claude` or project `CLAUDE.md`, no `settings.json` (which can otherwise silently override the effort a request asked for), and no MCP servers beyond the client tools this engine registers itself. Set to `false` for local debugging against your own Claude Code setup. |
 
 Authentication follows the SDK: `ANTHROPIC_API_KEY` when set, otherwise the
 signed-in Claude Code session. Note that Anthropic's Agent SDK documentation
@@ -232,8 +205,7 @@ products without prior approval, and directs them to API key authentication.
 
 `CONVERSATION_HISTORY=resume` continues the conversation Claude already holds
 rather than rebuilding it, so a long chat costs one message per turn instead of
-the whole transcript. It works on the `sdk` engine only: the CLI engine has no
-way to hand a client-executed tool result back into a running conversation.
+the whole transcript.
 
 OpenAI clients carry no session id, so the conversation is identified by
 content: each turn is fingerprinted and the resulting chain locates the session
@@ -246,21 +218,6 @@ If Claude no longer has the session, the SDK fails loudly with
 `No conversation found with session ID`; the gateway catches that, drops its
 record and retries with the full transcript, so the answer is still correct.
 
-The bookkeeping is kept in memory and never persisted. Losing it on restart
-means falling back to replaying - correct, just costlier. Persisting it would
-risk the opposite: a delta sent into a session that no longer holds the
-conversation behind it.
-
-Large prompts:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `PROMPT_FILE_DIR` | OS temp dir + `claude-code-api-prompts` | Scratch directory for per-request system prompt files. Keep it off any mounted volume: the files are short-lived and can hold sensitive text. |
-| `PROMPT_FILE_MAX_AGE_MINUTES` | `60` | Age at which an orphaned prompt file is swept at startup. Files are normally deleted when their process ends; this only catches hard crashes. |
-
-The conversation prompt is written to the CLI on stdin and the system prompt is
-passed via `--system-prompt-file`, so neither is limited by the operating
-system's command-line size (32 KB on Windows) nor visible in the process table.
 
 ## Bug Reports & Support
 

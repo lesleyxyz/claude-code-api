@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
-from claude_code_api.core.claude_manager import (
+from claude_code_api.core.projects import (
     cleanup_project_directory,
     create_project_directory,
 )

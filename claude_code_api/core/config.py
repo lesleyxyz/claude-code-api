@@ -2,17 +2,10 @@
 
 import os
 import shutil
-import tempfile
 from typing import List
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-from claude_code_api.utils.engine import ENGINE_SDK, normalize_engine
-from claude_code_api.utils.history import (
-    HISTORY_MODE_FLATTEN,
-    normalize_history_mode,
-)
 
 
 def find_claude_binary() -> str:
@@ -67,19 +60,8 @@ def default_project_root() -> str:
 
 
 def default_session_map_path() -> str:
-    """Default path for CLI-to-API session mapping."""
+    """Default path for the Claude-to-API session id mapping."""
     return os.path.join(os.getcwd(), "claude_sessions", "session_map.json")
-
-
-def default_prompt_file_dir() -> str:
-    """Scratch directory for per-request system prompt files.
-
-    Deliberately under the OS temp directory rather than the project tree: in
-    the Docker image every project path is a bind mount, and these files are
-    short-lived scratch that must not survive into a mounted volume. /tmp is
-    container-local and is discarded with the container.
-    """
-    return os.path.join(tempfile.gettempdir(), "claude-code-api-prompts")
 
 
 def default_log_file_path() -> str:
@@ -168,45 +150,31 @@ class Settings(BaseSettings):
     max_concurrent_sessions: int = 10
     session_timeout_minutes: int = 30
 
-    # Engine backing the API.
-    # cli - spawn `claude -p` per request and parse stream-json
-    # sdk - drive the Claude Agent SDK in-process, with native tools
-    engine: str = ENGINE_SDK
-
-    @field_validator("engine", mode="before")
-    def parse_engine(cls, v):
-        return normalize_engine(v)
-
     # How many extra attempts the SDK engine gets when the caller sent
     # tool_choice="required" (or named a tool) and the model answered without
     # calling it. Each retry is a follow-up message in the same session, so it
     # costs a turn rather than a request. 0 disables retrying.
     sdk_required_tool_attempts: int = 2
 
-    # Conversation history
-    # off      - last user message only (behaviour before history existed)
-    # flatten  - render the whole message array into the prompt
-    # resume   - reuse the CLI session, falling back to flatten
-    conversation_history: str = HISTORY_MODE_FLATTEN
-    # 0 disables the cap. 200k chars is roughly 50k tokens, which leaves
-    # room for the system prompt, both schemas and the answer.
-    conversation_history_max_chars: int = 200_000
+    # Whether the SDK engine runs isolated from this host's own Claude Code
+    # config: no ~/.claude or project CLAUDE.md, no settings.json (which can
+    # silently override the effort this API was asked for), and no MCP
+    # servers beyond the client tools this engine registers itself. On by
+    # default because a request through an OpenAI-compatible API should not
+    # inherit whatever is configured on the machine the server happens to run
+    # on. Off is for local debugging against your own Claude Code setup.
+    sdk_isolate_settings: bool = True
 
-    @field_validator("conversation_history", mode="before")
-    def parse_conversation_history(cls, v):
-        return normalize_history_mode(v)
+    # Cap on the rendered transcript when a conversation is replayed rather
+    # than resumed. 0 disables the cap. 200k chars is roughly 50k tokens,
+    # which leaves room for the system prompt, both schemas and the answer.
+    conversation_history_max_chars: int = 200_000
 
     # Project Configuration
     project_root: str = default_project_root()
     max_project_size_mb: int = 1000
     cleanup_interval_minutes: int = 60
     session_map_path: str = default_session_map_path()
-    # System prompts are handed to the CLI as files, not argv. Keep this
-    # off any mounted volume: it is scratch, and it can hold sensitive text.
-    prompt_file_dir: str = default_prompt_file_dir()
-    # Age at which an orphaned prompt file is swept, in minutes. Files are
-    # normally deleted when their process ends; this catches hard crashes.
-    prompt_file_max_age_minutes: int = 60
 
     # Database Configuration
     database_url: str = "sqlite:///./claude_api.db"

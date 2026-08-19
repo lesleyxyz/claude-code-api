@@ -1,12 +1,11 @@
 """Unit tests for the Claude Agent SDK engine.
 
-The adapter's whole job is to hand downstream code the same dicts the CLI's
-stream-json produces, so the parser, the SSE converter and the tool bridge need
-no knowledge of which engine ran. These tests pin that contract without
-touching the network: SDK message objects are constructed directly.
+The adapter's whole job is to hand downstream code stream-json shaped dicts,
+so the parser and the SSE converter need no knowledge of the SDK's own types.
+These tests pin that contract without touching the network: SDK message
+objects are constructed directly.
 """
 
-import pytest
 from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
@@ -17,9 +16,7 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
-from claude_code_api.core.config import Settings
 from claude_code_api.core.sdk_session import sdk_message_to_stream_dict
-from claude_code_api.utils.engine import ENGINE_CLI, ENGINE_SDK, normalize_engine
 from claude_code_api.utils.parser import ClaudeOutputParser, normalize_claude_message
 from claude_code_api.utils.streaming import create_non_streaming_response
 
@@ -60,36 +57,6 @@ def result(**kwargs):
     )
     defaults.update(kwargs)
     return ResultMessage(**defaults)
-
-
-class TestNormalizeEngine:
-    @pytest.mark.parametrize(
-        "value,expected",
-        [
-            (None, ENGINE_SDK),
-            ("", ENGINE_SDK),
-            ("  ", ENGINE_SDK),
-            ("CLI", ENGINE_CLI),
-            (" sdk ", ENGINE_SDK),
-        ],
-    )
-    def test_accepted_values(self, value, expected):
-        assert normalize_engine(value) == expected
-
-    def test_unknown_value_is_rejected(self):
-        with pytest.raises(ValueError, match="Supported values"):
-            normalize_engine("grpc")
-
-    def test_default_is_the_sdk_engine(self):
-        """Native tools are the default; the CLI engine is the fallback."""
-        assert Settings().engine == ENGINE_SDK
-
-    def test_cli_engine_remains_reachable(self):
-        assert Settings(engine="cli").engine == ENGINE_CLI
-
-    def test_settings_reject_a_bad_engine(self):
-        with pytest.raises(Exception):
-            Settings(engine="bogus")
 
 
 class TestMessageTranslation:
@@ -437,21 +404,12 @@ class TestInterception:
         assert call["function"]["arguments"] == '{"query":"slack"}'
 
 
-class TestToolSuppressionPerEngine:
-    """Regression: the same flag must mean opposite things per engine.
-
-    `suppress_internal_tools` hides tool_use blocks. On the CLI engine those are
-    Claude's own built-ins and must be hidden; on the SDK engine they are the
-    caller's registered tools and must pass through. Getting this wrong silently
-    strips every tool_call and returns finish_reason "stop" instead.
-    """
-
-    def _request(self, tools=None):
+class TestToolSystemPrompt:
+    def _request(self, **overrides):
         from claude_code_api.models.openai import ChatCompletionRequest
 
         payload = {"messages": [{"role": "user", "content": "go"}]}
-        if tools is not None:
-            payload["tools"] = tools
+        payload.update(overrides)
         return ChatCompletionRequest(**payload)
 
     @property
@@ -460,85 +418,102 @@ class TestToolSuppressionPerEngine:
             {
                 "type": "function",
                 "function": {
-                    "name": "search_nodes",
-                    "description": "search",
+                    "name": "t",
+                    "description": "d",
                     "parameters": {"type": "object", "properties": {}},
                 },
             }
         ]
 
-    def test_cli_engine_hides_builtin_tool_uses(self, monkeypatch):
-        from claude_code_api.api.chat import _suppress_internal_tools
-        from claude_code_api.core.config import settings
+    def test_callers_prompt_is_kept_when_nothing_is_demanded(self):
+        from claude_code_api.api.chat import _resolve_tool_system_prompt
 
-        monkeypatch.setattr(settings, "engine", ENGINE_CLI)
-        assert _suppress_internal_tools(self._request(self._tool)) is True
+        request = self._request(tools=self._tool)
+        assert _resolve_tool_system_prompt(request, "sys") == "sys"
 
-    def test_sdk_engine_lets_client_tool_uses_through(self, monkeypatch):
-        from claude_code_api.api.chat import _suppress_internal_tools
-        from claude_code_api.core.config import settings
+    def test_a_required_tool_appends_the_demand(self):
+        from claude_code_api.api.chat import _resolve_tool_system_prompt
 
-        monkeypatch.setattr(settings, "engine", ENGINE_SDK)
-        assert _suppress_internal_tools(self._request(self._tool)) is False
+        request = self._request(tools=self._tool, tool_choice="required")
+        resolved = _resolve_tool_system_prompt(request, "sys")
 
-    def test_no_tools_means_nothing_to_suppress(self, monkeypatch):
-        from claude_code_api.api.chat import _suppress_internal_tools
-        from claude_code_api.core.config import settings
-
-        monkeypatch.setattr(settings, "engine", ENGINE_CLI)
-        assert _suppress_internal_tools(self._request()) is False
+        assert resolved.startswith("sys")
+        assert "`t`" in resolved
 
 
-class TestBridgeIsSkippedOnSdkEngine:
-    def test_envelope_bridge_is_not_applied(self, monkeypatch):
-        """Native tools make the envelope emulation unnecessary and harmful."""
-        from claude_code_api.api.chat import _apply_tool_bridge
-        from claude_code_api.core.config import settings
-        from claude_code_api.models.openai import ChatCompletionRequest
+class TestStructuredOutputOptions:
+    """`response_format.json_schema` must reach the engine verbatim."""
 
-        request = ChatCompletionRequest(
-            messages=[{"role": "user", "content": "go"}],
-            tools=[
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "t",
-                        "description": "d",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                }
-            ],
+    SCHEMA = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+
+    def test_build_options_carries_the_schema_verbatim(self):
+        from claude_code_api.core.sdk_session import SdkSession
+
+        session = SdkSession(session_id="s", project_path=".")
+        options = session._build_options(
+            model=None, system_prompt=None, effort=None, json_schema=self.SCHEMA
         )
 
-        monkeypatch.setattr(settings, "engine", ENGINE_SDK)
-        bridge, schema, system_prompt = _apply_tool_bridge(request, None, "sys")
+        assert options.output_format == {
+            "type": "json_schema",
+            "schema": self.SCHEMA,
+        }
 
-        assert bridge is None
-        assert schema is None
-        assert system_prompt == "sys"
+    def test_no_schema_means_no_output_format(self):
+        from claude_code_api.core.sdk_session import SdkSession
 
-    def test_cli_engine_still_applies_the_bridge(self, monkeypatch):
-        from claude_code_api.api.chat import _apply_tool_bridge
-        from claude_code_api.core.config import settings
-        from claude_code_api.models.openai import ChatCompletionRequest
+        session = SdkSession(session_id="s", project_path=".")
+        options = session._build_options(model=None, system_prompt=None, effort=None)
 
-        request = ChatCompletionRequest(
-            messages=[{"role": "user", "content": "go"}],
-            tools=[
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "t",
-                        "description": "d",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                }
-            ],
+        assert options.output_format is None
+
+    def test_endpoint_passes_the_schema_through_untouched(
+        self, test_client, sdk_options
+    ):
+        from tests.model_utils import get_test_model_id
+
+        response = test_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": get_test_model_id(),
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": False,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "schema": self.SCHEMA},
+                },
+            },
         )
+        assert response.status_code == 200
+        assert sdk_options()[0].output_format == {
+            "type": "json_schema",
+            "schema": self.SCHEMA,
+        }
 
-        monkeypatch.setattr(settings, "engine", ENGINE_CLI)
-        bridge, schema, system_prompt = _apply_tool_bridge(request, None, "sys")
 
-        assert bridge is not None
-        assert schema is not None
-        assert "t" in system_prompt
+class TestSettingsIsolation:
+    """The SDK engine must not inherit whatever is configured on the host."""
+
+    def test_isolated_by_default(self):
+        from claude_code_api.core.sdk_session import SdkSession
+
+        session = SdkSession(session_id="s", project_path=".")
+        options = session._build_options(model=None, system_prompt=None, effort=None)
+
+        assert options.setting_sources == []
+        assert options.strict_mcp_config is True
+
+    def test_can_be_turned_off(self, monkeypatch):
+        from claude_code_api.core import sdk_session as module
+
+        monkeypatch.setattr(module.settings, "sdk_isolate_settings", False)
+        session = module.SdkSession(session_id="s", project_path=".")
+        options = session._build_options(model=None, system_prompt=None, effort=None)
+
+        assert options.setting_sources is None
+        assert options.strict_mcp_config is False

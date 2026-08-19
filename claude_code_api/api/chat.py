@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import re
 from types import SimpleNamespace
 import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
@@ -12,12 +11,8 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
-from claude_code_api.core.claude_manager import (
-    ClaudeCommandTooLongError,
-    ClaudeModelNotSupportedError,
-    ClaudeSessionConflictError,
-    create_project_directory,
-)
+from claude_code_api.core.errors import ClaudeSessionConflictError
+from claude_code_api.core.projects import create_project_directory
 from claude_code_api.core.config import settings
 from claude_code_api.core.session_manager import SessionManager
 from claude_code_api.models.claude import get_default_model, validate_claude_model
@@ -43,11 +38,9 @@ from claude_code_api.utils.streaming import (
     create_sse_response,
 )
 from claude_code_api.utils.effort import normalize_reasoning_effort
-from claude_code_api.utils.engine import ENGINE_SDK
 from claude_code_api.utils.sdk_prompt import resolve_system_prompt
 from claude_code_api.utils.tool_choice import required_tool_names
 from claude_code_api.utils.ledger import (
-    MODE_RESUME,
     conversation_fingerprints,
     fingerprint_system,
     is_session_missing_error,
@@ -60,7 +53,6 @@ from claude_code_api.utils.history import (
     render_prompt,
 )
 from claude_code_api.utils.time import utc_timestamp
-from claude_code_api.utils.tools import ToolBridge, build_tool_bridge
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -161,10 +153,10 @@ def _extract_json_schema(request: ChatCompletionRequest) -> Optional[Dict[str, A
 
 
 def _resolve_reasoning_effort(request: ChatCompletionRequest) -> Optional[str]:
-    """Map `reasoning_effort` onto a CLI --effort level, or None if unset.
+    """Map `reasoning_effort` onto an engine effort level, or None if unset.
 
-    The CLI only warns about an unknown level and then runs at its default, so
-    this is the only place a bad value can be reported back to the caller.
+    The engine only warns about an unknown level and then runs at its default,
+    so this is the only place a bad value can be reported back to the caller.
     """
     try:
         return normalize_reasoning_effort(request.reasoning_effort)
@@ -172,84 +164,25 @@ def _resolve_reasoning_effort(request: ChatCompletionRequest) -> Optional[str]:
         raise _input_error(str(e), "invalid_reasoning_effort") from e
 
 
-def _merge_system_prompt(system_prompt: Optional[str], addition: str) -> str:
-    """Append bridged-tool instructions to whatever system prompt the caller sent."""
-    if not system_prompt:
-        return addition
-    return f"{system_prompt}\n\n{addition}"
+def _resolve_tool_system_prompt(
+    request: ChatCompletionRequest, system_prompt: Optional[str]
+) -> Optional[str]:
+    """The system prompt to run with, given the caller's tools and tool_choice.
 
-
-def _apply_tool_bridge(
-    request: ChatCompletionRequest,
-    json_schema: Optional[Dict[str, Any]],
-    system_prompt: Optional[str],
-) -> Tuple[Optional[ToolBridge], Optional[Dict[str, Any]], Optional[str]]:
-    """Fold `tools`/`tool_choice` into the CLI's schema + system prompt.
-
-    Returns the bridge (None when tools are not in play) alongside the schema and
-    system prompt to actually run with. With no tools the caller's
-    `response_format` schema is passed through untouched; with tools it becomes
-    the schema of the envelope's `content` slot, so both OpenAI channels stay
-    available in the same request.
+    The engine registers the caller's tools for real, but a toolset has no
+    equivalent of `tool_choice`: it offers tools, it cannot oblige the model to
+    reach for one. Saying so in the system prompt is how the demand survives,
+    and `SdkSession` enforces it by asking again when a turn ends without the
+    call.
     """
-    if settings.engine == ENGINE_SDK:
-        # The SDK engine gives Claude the caller's tools for real, so the
-        # envelope emulation is not just unnecessary here - running it would
-        # constrain the reply to a JSON envelope the tools no longer need.
-        #
-        # What the envelope also carried, though, was `tool_choice`, and a real
-        # toolset has no equivalent of it: the SDK offers tools, it cannot
-        # oblige the model to reach for one. Saying so in the system prompt is
-        # how the demand survives, and `SdkSession` enforces it by asking again
-        # when a turn ends without the call.
-        required = required_tool_names(request)
-        if required:
-            logger.info(
-                "Requiring a client tool call on the SDK engine",
-                required_tools=required,
-                tool_choice=request.tool_choice,
-            )
-        return None, json_schema, resolve_system_prompt(system_prompt, required)
-
-    bridge = build_tool_bridge(request, content_schema=json_schema)
-    if bridge is None:
-        if request.tools:
-            # The caller declared tools but the bridge was skipped, so nothing
-            # tells the CLI they exist. The model then emits a native tool_use,
-            # the CLI answers "No such tool available", and the complaint ends
-            # up as prose. Loud on purpose: it is silent otherwise.
-            logger.warning(
-                "Tools were declared but the bridge was not applied; the model "
-                "has no channel to call them",
-                tool_count=len(request.tools),
-                tool_choice=request.tool_choice,
-                reason=(
-                    "tool_choice disables tools"
-                    if request.tool_choice == "none"
-                    else "no usable tool definitions"
-                ),
-            )
-        return None, json_schema, system_prompt
-
-    if json_schema is not None and bridge.force_tool_call:
-        logger.warning(
-            "response_format.json_schema cannot be honoured because tool_choice "
-            "forces a tool call, which leaves no content message to constrain",
-            tool_names=bridge.allowed_names,
+    required = required_tool_names(request)
+    if required:
+        logger.info(
+            "Requiring a client tool call",
+            required_tools=required,
+            tool_choice=request.tool_choice,
         )
-
-    logger.info(
-        "Bridging client tools onto --json-schema",
-        tool_names=bridge.allowed_names,
-        forced=bridge.force_tool_call,
-        parallel=bridge.allow_parallel,
-        has_content_schema=json_schema is not None,
-    )
-    return (
-        bridge,
-        bridge.schema,
-        _merge_system_prompt(system_prompt, bridge.instructions),
-    )
+    return resolve_system_prompt(system_prompt, required)
 
 
 # One event name for every resume-vs-new outcome, so `grep "Conversation
@@ -268,23 +201,7 @@ def _plan_conversation(
     Returns (plan, session id to reuse). The session id is None when nothing
     resumable was found, in which case the caller creates one as before.
 
-    Resuming is only attempted on the SDK engine: the CLI engine has no way to
-    hand a client-executed tool result back into a running conversation.
     """
-    resume_enabled = (
-        settings.engine == ENGINE_SDK and settings.conversation_history == MODE_RESUME
-    )
-    if not resume_enabled:
-        logger.info(
-            _CONTINUITY_EVENT,
-            decision="new",
-            reason=(
-                f"resume is off (engine={settings.engine}, "
-                f"history={settings.conversation_history})"
-            ),
-        )
-        return None, None
-
     fingerprints = conversation_fingerprints(request.messages)
     matched = session_manager.find_resumable(fingerprints)
     if matched is None:
@@ -305,7 +222,6 @@ def _plan_conversation(
         session_manager.get_ledger(matched_session_id),
         sdk_session_id,
         system_prompt,
-        MODE_RESUME,
         max_chars=settings.conversation_history_max_chars,
     )
     if not plan.resuming:
@@ -348,32 +264,11 @@ def _assistant_echo(response: Dict[str, Any]) -> Optional[Any]:
     )
 
 
-def _suppress_internal_tools(
-    request: ChatCompletionRequest, json_schema: Optional[Dict[str, Any]] = None
-) -> bool:
-    """Whether tool_use blocks in the stream should be hidden from the client.
-
-    On the CLI engine they are Claude's own built-ins - an implementation
-    detail the caller never declared. They are hidden whenever the caller sent
-    tools (the emulated call arrives separately in the envelope) or asked for
-    structured output (the validated payload is the whole answer).
-
-    On the SDK engine the caller's tools ARE registered with Claude, so a
-    tool_use block is exactly what the client asked for and must pass through -
-    including alongside a response_format, which is an independent channel
-    there rather than a competing one.
-    """
-    if settings.engine == ENGINE_SDK:
-        return False
-    return bool(request.tools) or json_schema is not None
-
-
 def _extract_prompts(request: ChatCompletionRequest) -> Tuple[str, str]:
-    """Render the request into the (prompt, system prompt) pair the CLI takes.
+    """Render the request into the (prompt, system prompt) pair the engine takes.
 
-    System messages stay in --system-prompt-file rather than being folded into the
-    transcript: they are instructions, not conversation, and they need to stay
-    adjacent to the tool-bridge block `_merge_system_prompt` appends.
+    System messages become the engine's system prompt rather than being folded
+    into the transcript: they are instructions, not conversation.
     """
     if not request.messages:
         raise _http_error(
@@ -396,7 +291,6 @@ def _extract_prompts(request: ChatCompletionRequest) -> Tuple[str, str]:
     try:
         user_prompt = render_prompt(
             request.messages,
-            mode=settings.conversation_history,
             max_chars=settings.conversation_history_max_chars,
         )
     except NoConversationTurnError as e:
@@ -829,6 +723,7 @@ def _responses_completed_payload(
     model: str,
     output_text: str,
     output_items: Optional[List[Dict[str, Any]]] = None,
+    usage: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
         "id": response_id,
@@ -847,11 +742,7 @@ def _responses_completed_payload(
             else _responses_output_items(message_id, output_text, [])
         ),
         "output_text": output_text,
-        "usage": {
-            "input_tokens": None,
-            "output_tokens": None,
-            "total_tokens": None,
-        },
+        "usage": _responses_usage_from_chat({"usage": usage} if usage else {}),
     }
 
 
@@ -873,6 +764,7 @@ async def _create_responses_sse_from_chat_stream(
     # the terminal payload reports them in that order.
     indexed_items: List[Tuple[int, Dict[str, Any]]] = []
     next_index = 0
+    final_usage: Optional[Dict[str, Any]] = None
 
     yield _responses_stream_event(
         "response.created",
@@ -907,6 +799,8 @@ async def _create_responses_sse_from_chat_stream(
                 return
 
             model = chunk.get("model") or model
+            if chunk.get("usage"):
+                final_usage = chunk["usage"]
             choices = chunk.get("choices") or []
             if not choices:
                 continue
@@ -1111,6 +1005,7 @@ async def _create_responses_sse_from_chat_stream(
                     model=model,
                     output_text=output_text,
                     output_items=output_items,
+                    usage=final_usage,
                 )
             },
         )
@@ -1151,8 +1046,6 @@ async def _collect_non_streaming_response(
     model: str,
     project_id: str,
     prefer_result_content: bool = False,
-    tool_bridge: Optional[ToolBridge] = None,
-    suppress_internal_tools: bool = False,
 ) -> Dict[str, Any]:
     messages, parser = await _gather_claude_messages(claude_process)
     _log_message_summary(messages)
@@ -1169,8 +1062,6 @@ async def _collect_non_streaming_response(
         usage_summary,
         project_id,
         prefer_result_content=prefer_result_content,
-        tool_bridge=tool_bridge,
-        suppress_internal_tools=suppress_internal_tools,
     )
     _log_response_payload(response)
     return response
@@ -1242,8 +1133,6 @@ def _build_non_streaming_response(
     usage_summary: Dict[str, Any],
     project_id: str,
     prefer_result_content: bool = False,
-    tool_bridge: Optional[ToolBridge] = None,
-    suppress_internal_tools: bool = False,
 ) -> Dict[str, Any]:
     response = create_non_streaming_response(
         messages=messages,
@@ -1251,46 +1140,9 @@ def _build_non_streaming_response(
         model=model,
         usage=usage_summary,
         prefer_result_content=prefer_result_content,
-        tool_bridge=tool_bridge,
-        suppress_internal_tools=suppress_internal_tools,
     )
     response["project_id"] = project_id
     return response
-
-
-# Prose the model produces after the CLI answers a native tool_use with
-# "No such tool available". Under tool_choice="auto" such a reply is a valid
-# envelope, so it reaches the client as a normal answer unless it is spotted.
-_TOOL_REFUSAL_PATTERN = re.compile(
-    r"no such tool available|tool[- ]access issue|"
-    r"tools? (?:are|is) not .{0,20}available",
-    re.IGNORECASE,
-)
-
-
-def _warn_if_tools_went_unused(
-    request: ChatCompletionRequest, response: Dict[str, Any]
-) -> None:
-    """Flag a turn where tools were offered but the model answered in prose."""
-    if not request.tools:
-        return
-
-    choices = response.get("choices") or []
-    message = choices[0].get("message", {}) if choices else {}
-    if message.get("tool_calls"):
-        return
-
-    content = message.get("content") or ""
-    if not _TOOL_REFUSAL_PATTERN.search(content):
-        return
-
-    logger.warning(
-        "Model reported tools as unavailable instead of calling them; retrying "
-        'with tool_choice="required" would make the prose path unrepresentable',
-        tool_count=len(request.tools),
-        tool_choice=request.tool_choice,
-        content_preview=content[:200],
-    )
 
 
 def _log_response_payload(response: Dict[str, Any]) -> None:
@@ -1419,9 +1271,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
         # Validate before any project directory or session row is created, so a
         # rejected request leaves nothing behind.
         effort = _resolve_reasoning_effort(request)
-        tool_bridge, json_schema, system_prompt = _apply_tool_bridge(
-            request, json_schema, system_prompt
-        )
+        system_prompt = _resolve_tool_system_prompt(request, system_prompt)
 
         # Handle project context
         project_id = request.project_id or f"default-{client_id}"
@@ -1454,7 +1304,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                 session_manager.register_cli_session(session_id, cli_session_id)
 
             engine_kwargs = {}
-            if settings.engine == ENGINE_SDK and request.tools:
+            if request.tools:
                 engine_kwargs["client_tools"] = request.tools
                 required_tools = required_tool_names(request)
                 if required_tools:
@@ -1469,7 +1319,6 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
             logger.info(
                 "Running turn",
                 conversation="resumed" if resuming_turn else "new",
-                engine=settings.engine,
                 session_id=session_id,
                 resume_session_id=(
                     turn_plan.resume_session_id if resuming_turn else None
@@ -1517,7 +1366,6 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                 logger.info(
                     "Running turn",
                     conversation="new",
-                    engine=settings.engine,
                     session_id=session_id,
                     resume_session_id=None,
                     prompt_chars=len(user_prompt),
@@ -1536,31 +1384,6 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                 "The session is currently busy with another process.",
                 "invalid_request_error",
                 "session_busy",
-            ) from e
-        except ClaudeCommandTooLongError as e:
-            logger.warning(
-                "Request too large for the operating system command line",
-                session_id=session_id,
-                error=str(e),
-            )
-            raise _http_error(
-                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                str(e),
-                "invalid_request_error",
-                "request_too_large",
-            ) from e
-        except ClaudeModelNotSupportedError as e:
-            logger.warning(
-                "Claude rejected requested model",
-                session_id=session_id,
-                model=claude_model,
-                error=str(e),
-            )
-            raise _http_error(
-                status.HTTP_400_BAD_REQUEST,
-                "The requested model is not supported.",
-                "invalid_request_error",
-                "model_not_supported",
             ) from e
         except Exception as e:
             logger.error(
@@ -1594,11 +1417,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                     response_model,
                     claude_process,
                     prefer_result_content=json_schema is not None,
-                    tool_bridge=tool_bridge,
                     hold_text_for_tool_calls=bool(request.tools),
-                    suppress_internal_tools=_suppress_internal_tools(
-                        request, json_schema
-                    ),
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -1612,11 +1431,6 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
 
         def _record_turn(response: Dict[str, Any]) -> None:
             """Note what this session has now been told, once the turn worked."""
-            if settings.engine != ENGINE_SDK:
-                return
-            if settings.conversation_history != MODE_RESUME:
-                return
-
             consumed = (
                 list(turn_plan.consumed)
                 if turn_plan is not None
@@ -1639,10 +1453,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
             model=response_model,
             project_id=project_id,
             prefer_result_content=json_schema is not None,
-            tool_bridge=tool_bridge,
-            suppress_internal_tools=_suppress_internal_tools(request, json_schema),
         )
-        _warn_if_tools_went_unused(request, completion)
         _record_turn(completion)
         return completion
 

@@ -10,9 +10,6 @@ This test suite tests the complete API functionality including:
 
 import asyncio
 import json
-import os
-import shutil
-import tempfile
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -20,10 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
 
-from claude_code_api.core.claude_manager import (
-    ClaudeModelNotSupportedError,
-    ClaudeSessionConflictError,
-)
+from claude_code_api.core.errors import ClaudeSessionConflictError
 from claude_code_api.core.config import settings
 from claude_code_api.core.session_manager import SessionManager
 from claude_code_api.main import app
@@ -48,41 +42,10 @@ def parse_sse_events(body_text: str) -> List[Dict[str, Any]]:
     return events
 
 
-class TestConfig:
-    """Test configuration."""
-
-    @classmethod
-    def setup_test_environment(cls):
-        """Setup test environment with mock Claude binary."""
-        # Create temporary directories for testing
-        test_root = PROJECT_ROOT / "dist" / "tests"
-        test_root.mkdir(parents=True, exist_ok=True)
-        cls.temp_dir = tempfile.mkdtemp(dir=str(test_root))
-        cls.project_root = os.path.join(cls.temp_dir, "projects")
-        os.makedirs(cls.project_root, exist_ok=True)
-
-        # Override settings for testing
-        settings.project_root = cls.project_root
-        settings.require_auth = False  # Disable auth for testing
-        # Keep real Claude binary - DO NOT mock it!
-        # settings.claude_binary_path should remain as found by find_claude_binary()
-        settings.database_url = f"sqlite:///{cls.temp_dir}/test.db"
-
-        return cls.temp_dir
-
-    @classmethod
-    def cleanup_test_environment(cls):
-        """Cleanup test environment."""
-        if hasattr(cls, "temp_dir") and os.path.exists(cls.temp_dir):
-            shutil.rmtree(cls.temp_dir)
-
-
 @pytest.fixture(scope="session")
-def test_environment():
-    """Setup and teardown test environment."""
-    temp_dir = TestConfig.setup_test_environment()
-    yield temp_dir
-    TestConfig.cleanup_test_environment()
+def test_environment(setup_test_environment):
+    """The suite-wide environment from conftest; kept for fixture wiring."""
+    yield setup_test_environment
 
 
 @pytest.fixture
@@ -312,7 +275,7 @@ class TestChatCompletions:
         message = choice["message"]
         assert "tool_calls" in message
         assert len(message["tool_calls"]) > 0
-        assert message["tool_calls"][0]["function"]["name"] == "bash"
+        assert message["tool_calls"][0]["function"]["name"] == "list_files"
 
     def test_chat_completion_streaming_tool_calls(self, client):
         """Test streaming tool call deltas."""
@@ -412,26 +375,6 @@ class TestChatCompletions:
         assert response.status_code == 409
         data = response.json()
         assert data["error"]["code"] == "session_busy"
-
-    def test_chat_completion_returns_model_not_supported(self, client, monkeypatch):
-        """Return HTTP 400 when Claude rejects the requested model."""
-        claude_manager = client.app.state.claude_manager
-
-        async def fake_create_session(*args, **kwargs):
-            raise ClaudeModelNotSupportedError("Unsupported model details")
-
-        monkeypatch.setattr(claude_manager, "create_session", fake_create_session)
-
-        request_data = {
-            "model": DEFAULT_MODEL,
-            "messages": [{"role": "user", "content": "Hi"}],
-            "stream": False,
-        }
-
-        response = client.post("/v1/chat/completions", json=request_data)
-        assert response.status_code == 400
-        data = response.json()
-        assert data["error"]["code"] == "model_not_supported"
 
 
 class TestConversationFlow:

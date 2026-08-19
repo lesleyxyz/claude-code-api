@@ -2,7 +2,7 @@
 
 The headline case is `TestAgentLoop`: an OpenAI client that feeds a tool result
 back used to get the same tool call again forever, because every message but
-the last user one was dropped before reaching the CLI.
+the last user one was dropped before reaching the engine.
 """
 
 import json
@@ -11,15 +11,11 @@ from types import SimpleNamespace
 import pytest
 
 from claude_code_api.api.chat import _extract_prompts
-from claude_code_api.core.config import Settings, settings
 from claude_code_api.models.openai import ChatCompletionRequest
 from claude_code_api.utils.history import (
     CURRENT_TURN_OPEN,
-    HISTORY_MODE_FLATTEN,
-    HISTORY_MODE_OFF,
     NoConversationTurnError,
     current_turn_text,
-    normalize_history_mode,
     render_prompt,
 )
 from tests.model_utils import get_test_model_id
@@ -60,13 +56,6 @@ class TestRenderPrompt:
             {"type": "text", "text": "line two"},
         ]
         assert render_prompt([msg("user", blocks)]) == "line one\nline two"
-
-    def test_off_mode_keeps_only_the_last_user_message(self):
-        prompt = render_prompt(
-            [msg("user", "one"), msg("assistant", "two"), msg("user", "three")],
-            mode=HISTORY_MODE_OFF,
-        )
-        assert prompt == "three"
 
     def test_multi_turn_keeps_order_and_does_not_duplicate(self):
         prompt = render_prompt(
@@ -245,31 +234,6 @@ class TestTruncation:
         assert huge in prompt
 
 
-class TestNormalizeHistoryMode:
-    @pytest.mark.parametrize(
-        "value,expected",
-        [
-            (None, HISTORY_MODE_FLATTEN),
-            ("", HISTORY_MODE_FLATTEN),
-            ("  ", HISTORY_MODE_FLATTEN),
-            ("OFF", HISTORY_MODE_OFF),
-            (" Flatten ", HISTORY_MODE_FLATTEN),
-            ("resume", "resume"),
-        ],
-    )
-    def test_accepted_values(self, value, expected):
-        assert normalize_history_mode(value) == expected
-
-    def test_unknown_value_is_rejected(self):
-        with pytest.raises(ValueError, match="Supported values"):
-            normalize_history_mode("bogus")
-
-    def test_settings_reject_a_bad_mode(self):
-        """A typo in a server env var should fail at startup, not silently."""
-        with pytest.raises(Exception):
-            Settings(conversation_history="bogus")
-
-
 class TestCurrentTurnText:
     def test_returns_the_newest_user_text(self):
         messages = [msg("user", "one"), msg("assistant", "two"), msg("user", "three")]
@@ -323,18 +287,6 @@ class TestExtractPrompts:
         assert exc.value.detail["error"]["code"] == "missing_user_message"
 
 
-@pytest.fixture
-def history_mode():
-    """Set the history mode for a test and restore it afterwards."""
-    original = settings.conversation_history
-
-    def _set(mode):
-        settings.conversation_history = mode
-
-    yield _set
-    settings.conversation_history = original
-
-
 class TestEndToEnd:
     def _post(self, client, messages, **kwargs):
         payload = {"model": get_test_model_id(), "messages": messages, "stream": False}
@@ -342,14 +294,14 @@ class TestEndToEnd:
         return client.post("/v1/chat/completions", json=payload)
 
     def test_single_turn_prompt_reaches_the_cli_unchanged(
-        self, test_client, cli_prompt
+        self, test_client, sdk_prompt
     ):
         """Zero tax on the common shape."""
         response = self._post(test_client, [{"role": "user", "content": "Hi"}])
         assert response.status_code == 200
-        assert cli_prompt()[0] == "Hi"
+        assert sdk_prompt()[0] == "Hi"
 
-    def test_multi_turn_history_reaches_the_cli(self, test_client, cli_prompt):
+    def test_multi_turn_history_reaches_the_cli(self, test_client, sdk_prompt):
         response = self._post(
             test_client,
             [
@@ -359,29 +311,12 @@ class TestEndToEnd:
             ],
         )
         assert response.status_code == 200
-        prompt = cli_prompt()[0]
+        prompt = sdk_prompt()[0]
         assert "first question" in prompt
         assert "first answer" in prompt
         assert "hello again" in prompt
 
-    def test_history_off_drops_earlier_turns(
-        self, test_client, cli_prompt, history_mode
-    ):
-        history_mode(HISTORY_MODE_OFF)
-        response = self._post(
-            test_client,
-            [
-                {"role": "user", "content": "first question"},
-                {"role": "assistant", "content": "first answer"},
-                {"role": "user", "content": "hello again"},
-            ],
-        )
-        assert response.status_code == 200
-        prompt = cli_prompt()[0]
-        assert prompt == "hello again"
-        assert "first question" not in prompt
-
-    def test_streaming_carries_history(self, test_client, cli_prompt):
+    def test_streaming_carries_history(self, test_client, sdk_prompt):
         response = self._post(
             test_client,
             [
@@ -392,9 +327,9 @@ class TestEndToEnd:
             stream=True,
         )
         assert response.status_code == 200
-        assert "first question" in cli_prompt()[0]
+        assert "first question" in sdk_prompt()[0]
 
-    def test_responses_api_carries_history(self, test_client, cli_prompt):
+    def test_responses_api_carries_history(self, test_client, sdk_prompt):
         """The Responses endpoint funnels into the same code path."""
         response = test_client.post(
             "/v1/responses",
@@ -408,14 +343,8 @@ class TestEndToEnd:
             },
         )
         assert response.status_code == 200
-        prompt = cli_prompt()[0]
+        prompt = sdk_prompt()[0]
         assert "first question" in prompt and "hello again" in prompt
-
-    def test_prompt_is_not_passed_in_argv(self, test_client, cli_argv):
-        response = self._post(test_client, [{"role": "user", "content": "Hi"}])
-        assert response.status_code == 200
-        argv = cli_argv()[0]
-        assert "Hi" not in argv
 
 
 class TestAgentLoop:
@@ -439,7 +368,7 @@ class TestAgentLoop:
     }
 
     def test_tool_result_produces_an_answer_not_another_call(
-        self, test_client, cli_prompt
+        self, test_client, sdk_prompt
     ):
         first = test_client.post(
             "/v1/chat/completions",
@@ -481,7 +410,7 @@ class TestAgentLoop:
         assert second.status_code == 200
 
         # The tool result, the call it answers and the tool name all reached the CLI.
-        second_prompt = cli_prompt()[1]
+        second_prompt = sdk_prompt()[1]
         assert "temp_c" in second_prompt
         assert call_id in second_prompt
         assert "get_weather" in second_prompt

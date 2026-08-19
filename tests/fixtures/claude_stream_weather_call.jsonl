@@ -1,3 +1,0 @@
-{"session_id": "sess_history_1", "model": "claude-haiku-4-5-20250929", "type": "system", "message": {"role": "system", "content": [{"type": "text", "text": "You are Claude Code."}]}, "cwd": ".", "tools": ["bash", "read"], "timestamp": "2026-02-04T00:00:00Z"}
-{"session_id": "sess_history_1", "model": "claude-haiku-4-5-20250929", "type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Checking the weather."}]}}
-{"session_id": "sess_history_1", "model": "claude-haiku-4-5-20250929", "type": "result", "result": "{\"tool_calls\": [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}]}", "usage": {"input_tokens": 30, "output_tokens": 20}, "cost_usd": 5e-05, "duration_ms": 1100, "num_turns": 1}

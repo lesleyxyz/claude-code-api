@@ -1,10 +1,12 @@
-"""Flatten an OpenAI message array into a single Claude CLI prompt.
+"""Render an OpenAI message array into a single prompt string.
 
-The CLI takes one prompt string, so a multi-turn conversation has to be
-rendered into it. Earlier turns are wrapped in `<conversation>` and the newest
-ones in `<current_turn>`; Claude parses XML-ish delimiters more reliably than
-markdown headers, and `<message role="assistant">` is far less likely to
-collide with content a caller actually sent than `### Assistant:` would be.
+The engine takes one prompt string per turn, so a conversation it does not
+already hold has to be rendered into it - every first turn, and every turn
+where a resume is refused (`utils.ledger`). Earlier turns are wrapped in
+`<conversation>` and the newest ones in `<current_turn>`; Claude parses
+XML-ish delimiters more reliably than markdown headers, and
+`<message role="assistant">` is far less likely to collide with content a
+caller actually sent than `### Assistant:` would be.
 
 The client stays the source of truth, which is what OpenAI clients expect: they
 are stateless and resend the whole array every request.
@@ -27,15 +29,6 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 import structlog
 
 logger = structlog.get_logger()
-
-HISTORY_MODE_OFF = "off"
-HISTORY_MODE_FLATTEN = "flatten"
-HISTORY_MODE_RESUME = "resume"
-
-# `resume` renders the same transcript as `flatten` whenever it cannot use the
-# CLI's own session state, so as far as this module is concerned they are one
-# mode. The distinction lives in the caller.
-HISTORY_MODES = (HISTORY_MODE_OFF, HISTORY_MODE_FLATTEN, HISTORY_MODE_RESUME)
 
 CONVERSATION_OPEN = "<conversation>"
 CONVERSATION_CLOSE = "</conversation>"
@@ -61,29 +54,7 @@ _TRUNCATION_TEMPLATE = (
 
 
 class NoConversationTurnError(ValueError):
-    """No message in the request carries anything to send to the CLI."""
-
-
-def normalize_history_mode(value: Optional[str]) -> str:
-    """Return a canonical history mode, defaulting to `flatten`.
-
-    Raises ValueError for an unrecognised value so a typo in a server env var
-    fails loudly at startup rather than silently disabling the feature.
-    """
-    if value is None:
-        return HISTORY_MODE_FLATTEN
-
-    requested = str(value).strip().lower()
-    if not requested:
-        return HISTORY_MODE_FLATTEN
-
-    if requested not in HISTORY_MODES:
-        supported = ", ".join(HISTORY_MODES)
-        raise ValueError(
-            f"Unsupported conversation_history {value!r}. "
-            f"Supported values: {supported}."
-        )
-    return requested
+    """No message in the request carries anything to send to the engine."""
 
 
 def _role(message: Any) -> str:
@@ -306,18 +277,14 @@ def current_turn_text(messages: Sequence[Any]) -> str:
 
 def render_prompt(
     messages: Sequence[Any],
-    mode: str = HISTORY_MODE_FLATTEN,
     max_chars: int = 0,
 ) -> str:
-    """Render an OpenAI message array into a single CLI prompt string."""
+    """Render an OpenAI message array into a single prompt string."""
     conversation = [m for m in messages if _role(m) != "system"]
 
     users = [m for m in conversation if _role(m) == "user"]
     if not users:
         raise NoConversationTurnError("At least one user message is required")
-
-    if mode == HISTORY_MODE_OFF:
-        return _text_of(users[-1])
 
     history, current = _split_turns(conversation)
 

@@ -30,7 +30,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import structlog
 
 from claude_code_api.utils.history import (
-    HISTORY_MODE_RESUME,
     render_prompt,
     tool_call_names,
 )
@@ -242,7 +241,6 @@ def plan_turn(
     ledger: Optional[SessionLedger],
     sdk_session_id: Optional[str],
     system_prompt: Optional[str],
-    mode: str,
     max_chars: int = 0,
 ) -> TurnPlan:
     """Choose between continuing Claude's session and replaying the transcript.
@@ -255,14 +253,12 @@ def plan_turn(
     def flatten(reason: str) -> TurnPlan:
         return TurnPlan(
             mode=MODE_FLATTEN,
-            prompt=render_prompt(messages, mode=mode, max_chars=max_chars),
+            prompt=render_prompt(messages, max_chars=max_chars),
             resume_session_id=None,
             reason=reason,
             consumed=list(conversation),
         )
 
-    if mode != HISTORY_MODE_RESUME:
-        return flatten("mode is not resume")
     if not sdk_session_id:
         return flatten("no Claude session recorded for this API session")
     if ledger is None or not ledger.fingerprints:

@@ -168,21 +168,6 @@ class TestStreaming:
         assert (saw_text, saw_tool_calls) == (False, True)
         assert len(self.deltas(chunks)) == 1
 
-    def test_suppressed_internal_tools_also_suppress_nothing_else(self):
-        # With internal tools hidden there is no call to shadow the text, so the
-        # text must survive: this is the CLI engine's built-in-tool case.
-        converter = OpenAIStreamConverter(
-            model="claude-sonnet-5", session_id="sess-1", suppress_internal_tools=True
-        )
-        message = normalize_claude_message(
-            assistant(text("Reading the file now."), tool_use(name="Read"))
-        )
-        chunks, saw_text, saw_tool_calls = converter._assistant_chunks(message)
-
-        assert saw_text is True
-        assert saw_tool_calls is False
-        assert self.deltas(chunks)[0]["content"] == "Reading the file now."
-
 
 class TestResponsesRouteInheritsIt:
     def test_the_message_item_disappears_with_the_narration(self):
@@ -231,7 +216,11 @@ async def stream_deltas(payloads, hold_text_for_tool_calls):
             body = line[6:].strip()
             if body == "[DONE]":
                 continue
-            choice = json.loads(body)["choices"][0]
+            choices = json.loads(body).get("choices") or []
+            if not choices:
+                # The trailing usage-only chunk (`choices: []`).
+                continue
+            choice = choices[0]
             deltas.append(choice["delta"])
             if choice.get("finish_reason"):
                 finish_reasons.append(choice["finish_reason"])
@@ -275,7 +264,9 @@ class TestStreamedNarrationDeferral:
         deltas, _ = await stream_deltas(
             [assistant(text("Paris.")), result()], hold_text_for_tool_calls=True
         )
-        content_at = next(i for i, d in enumerate(deltas) if d.get("content") == "Paris.")
+        content_at = next(
+            i for i, d in enumerate(deltas) if d.get("content") == "Paris."
+        )
         assert content_at < len(deltas) - 1
 
     @pytest.mark.asyncio

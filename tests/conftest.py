@@ -1,18 +1,24 @@
-"""Pytest configuration and fixtures."""
+"""Pytest configuration and fixtures.
 
-import json
+The deterministic suite runs against a fake `ClaudeSDKClient` installed over
+`claude_agent_sdk`, so no test spawns the Claude binary or reaches the network.
+The fake sits *above* the SDK's transport: it yields real SDK message objects,
+so `SdkSession`'s translation, interception and retry machinery all run for
+real. Set CLAUDE_CODE_API_USE_REAL_CLAUDE=1 to run against the real thing.
+"""
+
 import os
 import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any, Dict, List
 
 import pytest
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
 
 from claude_code_api.core.config import settings
-from claude_code_api.utils.engine import ENGINE_CLI
 from claude_code_api.utils.history import CURRENT_TURN_OPEN
 
 # Now import the app and configuration
@@ -21,125 +27,204 @@ from tests.model_utils import get_test_model_id
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
-# The mock CLI appends one JSON array per invocation here; see the `cli_argv`
-# fixture. Nothing asserts on the real CLI's argv, so this is the only way to
-# check that a request-level flag actually reaches the binary.
-CLI_ARGV_LOG_NAME = "claude_argv.jsonl"
-CLI_PROMPT_LOG_NAME = "claude_prompt.jsonl"
+# What each fake session records, exposed through the `sdk_prompt` and
+# `sdk_options` fixtures. Nothing asserts on the real SDK's wire protocol, so
+# this is the only way to check a request-level field actually reaches the
+# engine.
+SDK_PROMPTS: List[str] = []
+SDK_OPTIONS: List[Any] = []
 
 
-def _serialize_fixture_rules(fixture_rules, fixtures_dir: Path):
-    serialized_rules = []
-    for rule in fixture_rules:
-        matches = [str(match).lower() for match in rule.get("match", []) if match]
-        fixture_file = rule.get("file")
-        if not fixture_file or not matches:
-            continue
-        serialized_rules.append(
-            {
-                "matches": matches,
-                "fixture_path": str(fixtures_dir / fixture_file),
-            }
-        )
-    return serialized_rules
+def _use_real_claude() -> bool:
+    return os.environ.get("CLAUDE_CODE_API_USE_REAL_CLAUDE") == "1"
 
 
-def _create_mock_claude_binary(
-    temp_dir: str,
-    default_fixture: Path,
-    fixture_rules,
-    fixtures_dir: Path,
-    argv_log: Path,
-    prompt_log: Path,
-) -> str:
-    """Create a mock Claude CLI launcher that works on POSIX and Windows."""
-    serialized_rules = _serialize_fixture_rules(fixture_rules, fixtures_dir)
-    runner_path = Path(temp_dir) / "claude_mock.py"
-    runner_code = "\n".join(
-        [
-            "#!/usr/bin/env python3",
-            "import json",
-            "import sys",
-            "",
-            f"DEFAULT_FIXTURE = {str(default_fixture)!r}",
-            f"FIXTURE_RULES = {serialized_rules!r}",
-            f"ARGV_LOG = {str(argv_log)!r}",
-            f"PROMPT_LOG = {str(prompt_log)!r}",
-            f"CURRENT_TURN_OPEN = {CURRENT_TURN_OPEN!r}",
-            "",
-            "def _record(args):",
-            "    try:",
-            "        with open(ARGV_LOG, 'a', encoding='utf-8') as handle:",
-            "            handle.write(json.dumps(args) + '\\n')",
-            "    except OSError:",
-            "        pass",
-            "",
-            "def _extract_prompt(args):",
-            "    for idx, value in enumerate(args):",
-            "        if value == '-p':",
-            "            nxt = args[idx + 1] if idx + 1 < len(args) else None",
-            "            if nxt is not None and not nxt.startswith('-'):",
-            "                return nxt",
-            "            return sys.stdin.read()",
-            "    return ''",
-            "",
-            "def _record_prompt(prompt):",
-            "    try:",
-            "        with open(PROMPT_LOG, 'a', encoding='utf-8') as handle:",
-            "            handle.write(json.dumps(prompt) + '\\n')",
-            "    except OSError:",
-            "        pass",
-            "",
-            "def _resolve_fixture(prompt):",
-            "    # Match against the current turn only. Rules are substrings and",
-            "    # the LAST match wins, so transcript scaffolding would otherwise",
-            "    # steer selection: the 'hi' rule alone is hit by 'this',",
-            "    # 'which' and 'history'. Keep this window narrow.",
-            "    marker = prompt.rfind(CURRENT_TURN_OPEN)",
-            "    window = prompt[marker:] if marker != -1 else prompt",
-            "    window_lower = window.lower()",
-            "    fixture_path = DEFAULT_FIXTURE",
-            "    for rule in FIXTURE_RULES:",
-            "        if any(match in window_lower for match in rule['matches']):",
-            "            fixture_path = rule['fixture_path']",
-            "    return fixture_path",
-            "",
-            "def main():",
-            "    args = sys.argv[1:]",
-            "    if args and args[0] == '--version':",
-            "        print('Claude Code 1.0.0')",
-            "        return 0",
-            "    _record(args)",
-            "    prompt = _extract_prompt(args)",
-            "    _record_prompt(prompt)",
-            "    fixture_path = _resolve_fixture(prompt)",
-            "    with open(fixture_path, 'r', encoding='utf-8') as handle:",
-            "        sys.stdout.write(handle.read())",
-            "    return 0",
-            "",
-            "if __name__ == '__main__':",
-            "    raise SystemExit(main())",
-            "",
+# ---------------------------------------------------------------------------
+# Scripted turns. The router mirrors the old fixture index: substring rules
+# matched against the current-turn window of the prompt, LAST match wins -
+# transcript scaffolding would otherwise steer selection.
+# ---------------------------------------------------------------------------
+
+
+def _text_turn(text: str, session_id: str):
+    def build():
+        from claude_agent_sdk import AssistantMessage, TextBlock
+
+        return [
+            _assistant(AssistantMessage, [TextBlock(text=text)], session_id),
+            _result(session_id),
         ]
+
+    return build
+
+
+def _tool_turn(tool_name: str, arguments: Dict[str, Any], session_id: str):
+    """A turn that calls one of the client's tools (MCP-qualified)."""
+
+    def build():
+        from claude_agent_sdk import AssistantMessage, ToolUseBlock
+
+        block = ToolUseBlock(
+            id=f"toolu_{session_id}",
+            name=f"mcp__client__{tool_name}",
+            input=arguments,
+        )
+        return [
+            _assistant(AssistantMessage, [block], session_id),
+            _result(session_id),
+        ]
+
+    return build
+
+
+def _assistant(cls, blocks, session_id):
+    return cls(
+        content=blocks,
+        model="claude-haiku-4-5-20251001",
+        parent_tool_use_id=None,
+        error=None,
+        usage={"input_tokens": 12, "output_tokens": 8},
+        message_id=None,
+        stop_reason=None,
+        session_id=session_id,
+        uuid=None,
     )
-    runner_path.write_text(runner_code, encoding="utf-8")
+
+
+def _result(session_id):
+    from claude_agent_sdk import ResultMessage
+
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1200,
+        duration_api_ms=1000,
+        is_error=False,
+        num_turns=1,
+        session_id=session_id,
+        stop_reason=None,
+        total_cost_usd=0.00002,
+        usage={"input_tokens": 12, "output_tokens": 8},
+        result="ok",
+        structured_output=None,
+        model_usage=None,
+        permission_denials=None,
+        deferred_tool_use=None,
+        errors=None,
+        api_error_status=None,
+        uuid=None,
+        terminal_reason=None,
+        origin=None,
+    )
+
+
+# (substring matches, turn builder) - last match wins, like the old index.json.
+SDK_TURN_RULES = [
+    (
+        ("mapping test", "session map"),
+        _text_turn("Mapping acknowledged.", "sess_map_1"),
+    ),
+    (
+        ("list files", "list the files", "use a tool"),
+        _tool_turn("list_files", {"path": "."}, "sess_tool_1"),
+    ),
+    (("hi", "hello"), _text_turn("Hello! How can I help today?", "sess_simple_1")),
+    (
+        ("weather in paris",),
+        _tool_turn("get_weather", {"city": "Paris"}, "sess_weather_1"),
+    ),
+    (
+        ("temp_c",),
+        _text_turn("It is 18°C and cloudy in Paris.", "sess_weather_1"),
+    ),
+]
+DEFAULT_TURN = _text_turn("Hello! How can I help today?", "sess_simple_1")
+
+
+def _resolve_turn(prompt: str):
+    marker = prompt.rfind(CURRENT_TURN_OPEN)
+    window = (prompt[marker:] if marker != -1 else prompt).lower()
+    turn = DEFAULT_TURN
+    for matches, builder in SDK_TURN_RULES:
+        if any(match in window for match in matches):
+            turn = builder
+    return turn
+
+
+class FakeSDKClient:
+    """Stands in for `claude_agent_sdk.ClaudeSDKClient`.
+
+    Speaks the client's contract - `query()` then `receive_response()` until a
+    ResultMessage - and records every prompt and options object it is handed.
+    """
+
+    def __init__(self, options=None):
+        self.options = options
+        self._pending: List[Any] = []
+        SDK_OPTIONS.append(options)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def query(self, prompt: str, session_id: str = "default") -> None:
+        SDK_PROMPTS.append(prompt)
+        self._pending = _resolve_turn(prompt)()
+
+    async def receive_response(self):
+        pending, self._pending = self._pending, []
+        for message in pending:
+            yield message
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fake_sdk_client():
+    """Install the fake over the real SDK for the whole deterministic suite.
+
+    `SdkSession.start` imports `ClaudeSDKClient` from `claude_agent_sdk` at
+    call time, so patching the attribute on the package is sufficient - and
+    the only thing that works.
+    """
+    if _use_real_claude():
+        yield None
+        return
+
+    import claude_agent_sdk
+
+    real = claude_agent_sdk.ClaudeSDKClient
+    claude_agent_sdk.ClaudeSDKClient = FakeSDKClient
+    try:
+        yield FakeSDKClient
+    finally:
+        claude_agent_sdk.ClaudeSDKClient = real
+
+
+def _create_stub_claude_binary(temp_dir: str) -> str:
+    """A binary that only answers `--version`.
+
+    The fake intercepts everything above the SDK transport, so nothing ever
+    runs this beyond the startup availability gate - which does spawn it.
+    """
+    runner_path = Path(temp_dir) / "claude_stub.py"
+    runner_path.write_text(
+        "#!/usr/bin/env python3\nprint('Claude Code 1.0.0')\n", encoding="utf-8"
+    )
     os.chmod(runner_path, 0o755)
 
     if os.name == "nt":
         launcher_path = Path(temp_dir) / "claude.cmd"
-        launcher_code = f'@echo off\r\n"{sys.executable}" "{runner_path}" %*\r\n'
-        launcher_path.write_text(launcher_code, encoding="utf-8")
+        launcher_path.write_text(
+            f'@echo off\r\n"{sys.executable}" "{runner_path}" %*\r\n',
+            encoding="utf-8",
+        )
         return str(launcher_path)
 
     launcher_path = Path(temp_dir) / "claude"
-    launcher_code = "\n".join(
-        [
-            "#!/usr/bin/env sh",
-            f'exec "{sys.executable}" "{runner_path}" "$@"',
-            "",
-        ]
+    launcher_path.write_text(
+        f'#!/usr/bin/env sh\nexec "{sys.executable}" "{runner_path}" "$@"\n',
+        encoding="utf-8",
     )
-    launcher_path.write_text(launcher_code, encoding="utf-8")
     os.chmod(launcher_path, 0o755)
     return str(launcher_path)
 
@@ -160,41 +245,14 @@ def setup_test_environment():
         "database_url": getattr(settings, "database_url", "sqlite:///./test.db"),
         "debug": getattr(settings, "debug", False),
         "session_map_path": getattr(settings, "session_map_path", None),
-        "engine": getattr(settings, "engine", None),
     }
 
     # Set test settings
     settings.project_root = os.path.join(temp_dir, "projects")
     settings.require_auth = False
-    # Pin the CLI engine for the deterministic suite. The mock binary below
-    # speaks the CLI's argv/stdin protocol, not the stream-json control
-    # protocol the SDK uses, so leaving this on the default would quietly
-    # send the whole suite to the real Claude. The SDK engine is covered by
-    # tests/test_sdk_engine.py, which builds SDK objects directly.
-    settings.engine = ENGINE_CLI
 
-    # Prefer deterministic fixtures unless explicitly using real Claude
-    use_real_claude = os.environ.get("CLAUDE_CODE_API_USE_REAL_CLAUDE") == "1"
-    if not use_real_claude:
-        fixtures_dir = Path(__file__).parent / "fixtures"
-        index_path = fixtures_dir / "index.json"
-        default_fixture = fixtures_dir / "claude_stream_simple.jsonl"
-
-        fixture_rules = []
-        if index_path.exists():
-            try:
-                fixture_rules = json.loads(index_path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                raise RuntimeError(f"Failed to parse fixture index: {exc}") from exc
-
-        settings.claude_binary_path = _create_mock_claude_binary(
-            temp_dir=temp_dir,
-            default_fixture=default_fixture,
-            fixture_rules=fixture_rules,
-            fixtures_dir=fixtures_dir,
-            argv_log=Path(temp_dir) / CLI_ARGV_LOG_NAME,
-            prompt_log=Path(temp_dir) / CLI_PROMPT_LOG_NAME,
-        )
+    if not _use_real_claude():
+        settings.claude_binary_path = _create_stub_claude_binary(temp_dir)
     else:
         # Ensure the real binary is available when requested
         if not shutil.which(settings.claude_binary_path) and not os.path.exists(
@@ -226,48 +284,23 @@ def setup_test_environment():
 
 
 @pytest.fixture
-def cli_argv(setup_test_environment):
-    """Return a callable giving the argv of each mock-CLI run in this test."""
-    if os.environ.get("CLAUDE_CODE_API_USE_REAL_CLAUDE") == "1":
-        pytest.skip("argv recording requires the fixture CLI")
+def sdk_prompt(setup_test_environment):
+    """Return a callable giving the prompt of each engine turn in this test."""
+    if _use_real_claude():
+        pytest.skip("prompt recording requires the fake SDK client")
 
-    log_path = Path(setup_test_environment) / CLI_ARGV_LOG_NAME
-    log_path.write_text("", encoding="utf-8")  # isolate this test
-
-    def _read():
-        if not log_path.exists():
-            return []
-        return [
-            json.loads(line)
-            for line in log_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-
-    return _read
+    start = len(SDK_PROMPTS)
+    return lambda: SDK_PROMPTS[start:]
 
 
 @pytest.fixture
-def cli_prompt(setup_test_environment):
-    """Return a callable giving the prompt each mock-CLI run received.
+def sdk_options(setup_test_environment):
+    """Return a callable giving the ClaudeAgentOptions of each engine session."""
+    if _use_real_claude():
+        pytest.skip("options recording requires the fake SDK client")
 
-    The prompt travels on stdin now, so it is no longer visible in `cli_argv`.
-    """
-    if os.environ.get("CLAUDE_CODE_API_USE_REAL_CLAUDE") == "1":
-        pytest.skip("prompt recording requires the fixture CLI")
-
-    log_path = Path(setup_test_environment) / CLI_PROMPT_LOG_NAME
-    log_path.write_text("", encoding="utf-8")  # isolate this test
-
-    def _read():
-        if not log_path.exists():
-            return []
-        return [
-            json.loads(line)
-            for line in log_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-
-    return _read
+    start = len(SDK_OPTIONS)
+    return lambda: SDK_OPTIONS[start:]
 
 
 @pytest.fixture

@@ -137,7 +137,7 @@ class TestPlanTurn:
             msg("user", "second question"),
         ]
 
-        plan = plan_turn(messages, ledger, "sdk-1", "sys", MODE_RESUME)
+        plan = plan_turn(messages, ledger, "sdk-1", "sys")
 
         assert plan.mode == MODE_RESUME
         assert plan.resume_session_id == "sdk-1"
@@ -156,29 +156,22 @@ class TestPlanTurn:
             + [msg("tool", '{"temp_c":18}', tool_call_id="c1")]
         )
 
-        plan = plan_turn(messages, ledger, "sdk-1", "sys", MODE_RESUME)
+        plan = plan_turn(messages, ledger, "sdk-1", "sys")
 
         assert plan.mode == MODE_RESUME
         assert "get_weather" in plan.prompt
         assert "c1" in plan.prompt
         assert "temp_c" in plan.prompt
 
-    def test_flattens_when_the_mode_is_not_resume(self):
-        ledger = ledger_for([msg("user", "first question")])
-        plan = plan_turn(self._base(), ledger, "sdk-1", "sys", MODE_FLATTEN)
-
-        assert plan.mode == MODE_FLATTEN
-        assert plan.resuming is False
-
     def test_flattens_without_a_claude_session(self):
         ledger = ledger_for([msg("user", "first question")])
-        plan = plan_turn(self._base(), ledger, None, "sys", MODE_RESUME)
+        plan = plan_turn(self._base(), ledger, None, "sys")
 
         assert plan.mode == MODE_FLATTEN
         assert "no Claude session" in plan.reason
 
     def test_flattens_with_no_ledger(self):
-        plan = plan_turn(self._base(), None, "sdk-1", "sys", MODE_RESUME)
+        plan = plan_turn(self._base(), None, "sdk-1", "sys")
         assert plan.mode == MODE_FLATTEN
 
     def test_flattens_when_the_system_prompt_changed(self):
@@ -186,7 +179,7 @@ class TestPlanTurn:
         ledger = ledger_for([msg("user", "first question")], system="sys")
         messages = self._base() + [msg("user", "next")]
 
-        plan = plan_turn(messages, ledger, "sdk-1", "a different prompt", MODE_RESUME)
+        plan = plan_turn(messages, ledger, "sdk-1", "a different prompt")
 
         assert plan.mode == MODE_FLATTEN
         assert "system prompt changed" in plan.reason
@@ -202,7 +195,7 @@ class TestPlanTurn:
             msg("user", "next"),
         ]
 
-        plan = plan_turn(messages, ledger, "sdk-1", "sys", MODE_RESUME)
+        plan = plan_turn(messages, ledger, "sdk-1", "sys")
 
         assert plan.mode == MODE_FLATTEN
         assert "diverges" in plan.reason
@@ -217,14 +210,14 @@ class TestPlanTurn:
         )
         messages = [msg("system", "sys"), msg("user", "first question")]
 
-        plan = plan_turn(messages, ledger, "sdk-1", "sys", MODE_RESUME)
+        plan = plan_turn(messages, ledger, "sdk-1", "sys")
         assert plan.mode == MODE_FLATTEN
 
     def test_flattens_when_there_is_nothing_new(self):
         history = [msg("user", "first question")]
         ledger = ledger_for(history)
 
-        plan = plan_turn(self._base(), ledger, "sdk-1", "sys", MODE_RESUME)
+        plan = plan_turn(self._base(), ledger, "sdk-1", "sys")
 
         assert plan.mode == MODE_FLATTEN
         assert "nothing new" in plan.reason
@@ -237,7 +230,7 @@ class TestPlanTurn:
             msg("user", "next"),
         ]
 
-        plan = plan_turn(messages, ledger, "sdk-1", "sys", MODE_RESUME)
+        plan = plan_turn(messages, ledger, "sdk-1", "sys")
 
         assert plan.mode == MODE_FLATTEN
         assert "assistant message" in plan.reason
@@ -246,7 +239,7 @@ class TestPlanTurn:
         ledger = ledger_for([msg("user", "x")])
         messages = self._base() + [msg("assistant", "a"), msg("user", "b")]
 
-        plan = plan_turn(messages, ledger, "sdk-1", "sys", MODE_RESUME)
+        plan = plan_turn(messages, ledger, "sdk-1", "sys")
 
         assert plan.mode == MODE_FLATTEN
         assert "first question" in plan.prompt

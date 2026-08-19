@@ -5,11 +5,10 @@ import contextlib
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Protocol, Tuple
 
 import structlog
 
-from claude_code_api.core.claude_manager import ClaudeProcess
 from claude_code_api.utils.parser import (
     ClaudeOutputParser,
     OpenAIConverter,
@@ -17,11 +16,16 @@ from claude_code_api.utils.parser import (
     tool_use_to_openai_call,
 )
 from claude_code_api.utils.time import utc_timestamp
-from claude_code_api.utils.tools import ToolBridge
 
 logger = structlog.get_logger()
 
 CHUNK_OBJECT_TYPE = "chat.completion.chunk"
+
+
+class OutputSource(Protocol):
+    """Anything that yields stream-json dicts: an engine session."""
+
+    def get_output(self) -> AsyncGenerator[Dict[str, Any], None]: ...
 
 
 class SSEFormatter:
@@ -65,8 +69,6 @@ class OpenAIStreamConverter:
         model: str,
         session_id: str,
         prefer_result_content: bool = False,
-        tool_bridge: Optional[ToolBridge] = None,
-        suppress_internal_tools: bool = False,
         hold_text_for_tool_calls: bool = False,
     ):
         self.model = model
@@ -84,11 +86,6 @@ class OpenAIStreamConverter:
         self.hold_text_for_tool_calls = hold_text_for_tool_calls
         self._held_text_chunks: List[str] = []
         self.prefer_result_content = prefer_result_content
-        self.tool_bridge = tool_bridge
-        # Decided by the caller, which knows which engine ran: on the CLI
-        # engine a tool_use block is one of Claude's built-ins, on the SDK
-        # engine it is the client's own tool and must survive.
-        self.suppress_internal_tools = suppress_internal_tools
 
     def _build_chunk(
         self, delta: Dict[str, Any], finish_reason: Optional[str] = None
@@ -99,6 +96,21 @@ class OpenAIStreamConverter:
             "created": self.created,
             "model": self.model,
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+
+    def _build_usage_chunk(self) -> Dict[str, Any]:
+        usage = OpenAIConverter.calculate_usage(self.parser)
+        return {
+            "id": self.completion_id,
+            "object": CHUNK_OBJECT_TYPE,
+            "created": self.created,
+            "model": self.model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            },
         }
 
     def _index_tool_calls(self, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -124,11 +136,7 @@ class OpenAIStreamConverter:
         # text is an answer or narration in front of a call. A stream cannot
         # retract text it has already sent, so the choice has to be made here,
         # while both halves of the message are in hand.
-        tool_uses = (
-            self.parser.extract_tool_uses(message)
-            if not self.suppress_internal_tools
-            else []
-        )
+        tool_uses = self.parser.extract_tool_uses(message)
 
         # In schema mode, the final `result` payload is the sole authoritative
         # content; skip incremental assistant text so clients don't receive it
@@ -145,10 +153,6 @@ class OpenAIStreamConverter:
                     chunks.append(event)
                 saw_text = True
 
-        # Claude's own built-in tools are an implementation detail. Leaking them
-        # would hand the client tool calls it never declared - and a client that
-        # sent tool_choice:"none" asked for none at all. `tool_uses` is already
-        # empty in that case.
         if tool_uses:
             if self._held_text_chunks:
                 logger.info(
@@ -166,38 +170,21 @@ class OpenAIStreamConverter:
         return chunks, saw_text, saw_tool_calls
 
     def _final_chunks(self, message: Any) -> Tuple[List[str], bool, bool]:
-        """Emit the CLI's validated `result` payload as content and/or tool calls."""
+        """Emit the schema-validated `result` payload as the turn's content."""
         if not self.prefer_result_content:
             return [], False, False
 
-        if self.tool_bridge is None:
-            result = (message.result or "").strip()
-            if not result:
-                return [], False, False
-            return (
-                [SSEFormatter.format_event(self._build_chunk({"content": result}))],
-                True,
-                False,
-            )
-
-        content, tool_calls = self.tool_bridge.convert_result(message.result)
-        chunks: List[str] = []
-        if content:
-            chunks.append(
-                SSEFormatter.format_event(self._build_chunk({"content": content}))
-            )
-        if tool_calls:
-            chunks.append(
-                SSEFormatter.format_event(
-                    self._build_chunk(
-                        {"tool_calls": self._index_tool_calls(tool_calls)}
-                    )
-                )
-            )
-        return chunks, bool(content), bool(tool_calls)
+        result = (message.result or "").strip()
+        if not result:
+            return [], False, False
+        return (
+            [SSEFormatter.format_event(self._build_chunk({"content": result}))],
+            True,
+            False,
+        )
 
     async def convert_stream(
-        self, claude_process: ClaudeProcess
+        self, claude_process: "OutputSource"
     ) -> AsyncGenerator[str, None]:
         """Convert Claude Code output stream to OpenAI format."""
         try:
@@ -244,6 +231,12 @@ class OpenAIStreamConverter:
                 self._build_chunk({}, finish_reason=finish_reason)
             )
 
+            # A trailing usage-only chunk (`choices: []`), matching OpenAI's
+            # `stream_options.include_usage` shape - the only place a stream
+            # can report real token counts, since there is no final message to
+            # attach them to.
+            yield SSEFormatter.format_event(self._build_usage_chunk())
+
             # Send completion signal
             yield SSEFormatter.format_completion()
 
@@ -269,10 +262,8 @@ class StreamingManager:
         self,
         session_id: str,
         model: str,
-        claude_process: ClaudeProcess,
+        claude_process: "OutputSource",
         prefer_result_content: bool = False,
-        tool_bridge: Optional[ToolBridge] = None,
-        suppress_internal_tools: bool = False,
         hold_text_for_tool_calls: bool = False,
     ) -> AsyncGenerator[str, None]:
         """Create new streaming connection."""
@@ -280,8 +271,6 @@ class StreamingManager:
             model,
             session_id,
             prefer_result_content=prefer_result_content,
-            tool_bridge=tool_bridge,
-            suppress_internal_tools=suppress_internal_tools,
             hold_text_for_tool_calls=hold_text_for_tool_calls,
         )
         heartbeat_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
@@ -432,10 +421,8 @@ streaming_manager = StreamingManager()
 async def create_sse_response(
     session_id: str,
     model: str,
-    claude_process: ClaudeProcess,
+    claude_process: "OutputSource",
     prefer_result_content: bool = False,
-    tool_bridge: Optional[ToolBridge] = None,
-    suppress_internal_tools: bool = False,
     hold_text_for_tool_calls: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Create SSE response for Claude Code output."""
@@ -445,8 +432,6 @@ async def create_sse_response(
             model,
             claude_process,
             prefer_result_content=prefer_result_content,
-            tool_bridge=tool_bridge,
-            suppress_internal_tools=suppress_internal_tools,
             hold_text_for_tool_calls=hold_text_for_tool_calls,
         ):
             yield chunk
@@ -524,8 +509,6 @@ def create_non_streaming_response(
     model: str,
     usage: Optional[Dict[str, Any]] = None,
     prefer_result_content: bool = False,
-    tool_bridge: Optional[ToolBridge] = None,
-    suppress_internal_tools: bool = False,
 ) -> Dict[str, Any]:
     """Create non-streaming response."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
@@ -548,18 +531,9 @@ def create_non_streaming_response(
     else:
         complete_content = ""
 
-    if suppress_internal_tools:
-        # Claude's own built-in tool uses are an implementation detail; a client
-        # only ever hears about the tools it declared.
-        tool_calls = []
-
     if prefer_result_content:
         result_content = _extract_result_content(messages)
-        if tool_bridge is not None:
-            # The envelope is authoritative, including which calls it carries.
-            bridged_content, tool_calls = tool_bridge.convert_result(result_content)
-            complete_content = bridged_content or ""
-        elif result_content is not None:
+        if result_content is not None:
             # A schema-validated payload replaces whatever the stream produced.
             tool_calls = []
             complete_content = result_content.strip()

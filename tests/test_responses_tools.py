@@ -397,6 +397,23 @@ def chat_sse(delta, finish_reason=None):
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def chat_sse_usage(prompt_tokens, completion_tokens, total_tokens):
+    """The trailing usage-only chunk (`choices: []`) the chat stream sends."""
+    payload = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion.chunk",
+        "created": 1700000000,
+        "model": "claude-sonnet-5",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        },
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 class FakeChatStream:
     """Stands in for the StreamingResponse the chat route returns."""
 
@@ -616,3 +633,56 @@ class TestStreamedToolCalls:
 
         assert [i["type"] for i in completed(events)["output"]] == ["message"]
         assert completed(events)["output_text"] == ""
+
+    @pytest.mark.asyncio
+    async def test_the_trailing_usage_chunk_reaches_the_completed_payload(self):
+        # A client that reads `response.completed.usage` needs real counts, not
+        # the all-null placeholder a turn with no usage chunk falls back to.
+        events = await collect(
+            [
+                chat_sse(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "toolu_1",
+                                "function": {"name": "roll_dice", "arguments": "{}"},
+                            }
+                        ]
+                    }
+                ),
+                chat_sse_usage(12, 8, 20),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        assert completed(events)["usage"] == {
+            "input_tokens": 12,
+            "output_tokens": 8,
+            "total_tokens": 20,
+        }
+
+    @pytest.mark.asyncio
+    async def test_usage_defaults_to_null_without_a_usage_chunk(self):
+        events = await collect(
+            [
+                chat_sse(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "toolu_1",
+                                "function": {"name": "roll_dice", "arguments": "{}"},
+                            }
+                        ]
+                    }
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        assert completed(events)["usage"] == {
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+        }

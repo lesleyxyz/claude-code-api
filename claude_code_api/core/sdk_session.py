@@ -1,37 +1,23 @@
-"""Claude Agent SDK engine, an alternative to spawning the CLI per request.
+"""The Claude Agent SDK engine.
 
-The CLI engine (`core.claude_manager`) shells out to `claude -p` and parses
-stream-json off stdout. That works, but it forces two workarounds this module
-exists to remove:
+Client tools are real here: each OpenAI tool definition becomes an in-process
+MCP tool (`utils.sdk_tools`), so a tool call arrives as a genuine
+`ToolUseBlock` instead of being emulated. `ClaudeAgentOptions(tools=[])`
+removes every built-in, leaving only the client's tools visible.
 
-* Client tools have to be *emulated*. The CLI has no caller-supplied tools, so
-  `utils.tools` describes them in the system prompt and constrains the reply to
-  a JSON envelope with `--json-schema`. The SDK takes real tools through an
-  in-process MCP server, so a tool call arrives as a genuine `ToolUseBlock`.
-* The CLI's own toolset is always present, so the model can go looking for a
-  client tool among its built-ins, fail, and report "No such tool available".
-  `ClaudeAgentOptions(tools=[])` removes every built-in, leaving only the
-  client's.
-
-To keep the blast radius small, SDK messages are translated into exactly the
-dicts the CLI's stream-json produces, so `utils.parser`, `utils.streaming` and
-the tool bridge keep working unchanged and the two engines stay swappable.
+SDK messages are translated into the stream-json dict shape the rest of the
+package speaks (`utils.parser`, `utils.streaming`), so nothing downstream
+needs any knowledge of the SDK's own types.
 """
 
 import asyncio
+import functools
 import inspect
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Sequence
 
 import structlog
 
 from claude_code_api.models.claude import get_default_model
-
-from claude_code_api.utils.engine import (  # noqa: F401  (re-exported)
-    ENGINE_CLI,
-    ENGINE_SDK,
-    ENGINES,
-    normalize_engine,
-)
 
 from claude_code_api.utils.sdk_prompt import required_tool_nudge
 from claude_code_api.utils.sdk_tools import (
@@ -42,8 +28,38 @@ from claude_code_api.utils.sdk_tools import (
 )
 
 from .config import settings
+from .errors import (
+    ClaudeConcurrencyError,
+    ClaudeProcessStartError,
+    ClaudeSessionConflictError,
+)
 
 logger = structlog.get_logger()
+
+
+@functools.lru_cache(maxsize=8)
+def _binary_runs(binary_path: str) -> bool:
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [binary_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def validate_claude_binary() -> bool:
+    """Whether the Claude Code binary the SDK will spawn actually runs.
+
+    Cached per path: this is asked at startup and again by every /health
+    probe, and the answer only changes when the configured path does.
+    """
+    return _binary_runs(settings.claude_binary_path)
 
 
 def _content_block_to_dict(block: Any) -> Optional[Dict[str, Any]]:
@@ -151,11 +167,10 @@ async def _emit(sink: Callable[[Dict[str, Any]], Any], payload: Dict[str, Any]) 
 
 
 class SdkSession:
-    """One Agent SDK conversation, shaped like `ClaudeProcess`.
+    """One Agent SDK conversation.
 
-    The public surface deliberately mirrors the CLI engine - `get_output()`,
-    `stop()`, `is_running`, `cli_session_id` - so `api.chat` can hold either
-    without knowing which it has.
+    `api.chat` consumes it through `get_output()`, `stop()`, `is_running` and
+    `cli_session_id` (Claude's own session id, kept for resuming).
     """
 
     def __init__(
@@ -221,6 +236,21 @@ class SdkSession:
             "tools": [],
             "cwd": self.project_path,
         }
+        if settings.sdk_isolate_settings:
+            # `[]` is the SDK's own isolation mode: no ~/.claude or project
+            # CLAUDE.md, no settings.json. Without it, whatever the host
+            # happens to have configured - including an effort override -
+            # rides along on every request this engine serves.
+            options["setting_sources"] = []
+            # The only MCP server this engine ever wants live is the one it
+            # builds itself for the caller's tools; a stray project .mcp.json
+            # or host-level MCP config must not be able to add tools the
+            # caller never declared.
+            options["strict_mcp_config"] = True
+        if settings.claude_binary_path:
+            # The SDK resolves `claude` from PATH by default; this keeps
+            # non-PATH installs (Docker, nvm) working.
+            options["cli_path"] = settings.claude_binary_path
         if model:
             options["model"] = model
         if system_prompt:
@@ -465,7 +495,7 @@ class SdkSession:
         }
 
     async def get_output(self) -> AsyncGenerator[Dict[str, Any], None]:
-        """Yield translated messages, matching `ClaudeProcess.get_output`."""
+        """Yield translated messages until the turn ends."""
         while True:
             try:
                 output = await asyncio.wait_for(
@@ -512,7 +542,7 @@ class SdkSession:
 
 
 class SdkManager:
-    """Manages SDK sessions, mirroring `ClaudeManager`'s consumed surface."""
+    """Manages SDK sessions."""
 
     def __init__(self) -> None:
         self.sessions: Dict[str, SdkSession] = {}
@@ -521,6 +551,14 @@ class SdkManager:
     async def get_version(self) -> str:
         from claude_agent_sdk import __version__ as sdk_version
 
+        # The SDK wheel being importable says nothing about the Claude Code
+        # binary it spawns; a missing binary should fail startup, not the
+        # first request.
+        if not validate_claude_binary():
+            raise ClaudeProcessStartError(
+                f"Claude Code binary not available at "
+                f"{settings.claude_binary_path!r}"
+            )
         return f"Claude Agent SDK {sdk_version}"
 
     async def create_session(
@@ -537,12 +575,12 @@ class SdkManager:
         resume: Optional[str] = None,
         required_tool_names: Optional[Sequence[str]] = None,
     ) -> SdkSession:
-        from .claude_manager import (
-            ClaudeProcessStartError,
-            ClaudeSessionConflictError,
-        )
-
         async with self._lock:
+            if len(self.sessions) >= settings.max_concurrent_sessions:
+                raise ClaudeConcurrencyError(
+                    f"Maximum concurrent sessions "
+                    f"({settings.max_concurrent_sessions}) reached"
+                )
             existing = self.sessions.get(session_id)
             if existing and existing.is_running:
                 raise ClaudeSessionConflictError(

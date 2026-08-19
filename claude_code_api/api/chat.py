@@ -40,6 +40,8 @@ from claude_code_api.utils.streaming import (
 )
 from claude_code_api.utils.effort import normalize_reasoning_effort
 from claude_code_api.utils.engine import ENGINE_SDK
+from claude_code_api.utils.sdk_prompt import resolve_system_prompt
+from claude_code_api.utils.tool_choice import required_tool_names
 from claude_code_api.utils.ledger import (
     MODE_RESUME,
     conversation_fingerprints,
@@ -190,7 +192,20 @@ def _apply_tool_bridge(
         # The SDK engine gives Claude the caller's tools for real, so the
         # envelope emulation is not just unnecessary here - running it would
         # constrain the reply to a JSON envelope the tools no longer need.
-        return None, json_schema, system_prompt
+        #
+        # What the envelope also carried, though, was `tool_choice`, and a real
+        # toolset has no equivalent of it: the SDK offers tools, it cannot
+        # oblige the model to reach for one. Saying so in the system prompt is
+        # how the demand survives, and `SdkSession` enforces it by asking again
+        # when a turn ends without the call.
+        required = required_tool_names(request)
+        if required:
+            logger.info(
+                "Requiring a client tool call on the SDK engine",
+                required_tools=required,
+                tool_choice=request.tool_choice,
+            )
+        return None, json_schema, resolve_system_prompt(system_prompt, required)
 
     bridge = build_tool_bridge(request, content_schema=json_schema)
     if bridge is None:
@@ -233,6 +248,12 @@ def _apply_tool_bridge(
     )
 
 
+# One event name for every resume-vs-new outcome, so `grep "Conversation
+# continuity"` shows the decision and its reason for every turn - including the
+# turns that never get as far as considering a resume.
+_CONTINUITY_EVENT = "Conversation continuity"
+
+
 def _plan_conversation(
     request: ChatCompletionRequest,
     session_manager: SessionManager,
@@ -250,11 +271,25 @@ def _plan_conversation(
         settings.engine == ENGINE_SDK and settings.conversation_history == MODE_RESUME
     )
     if not resume_enabled:
+        logger.info(
+            _CONTINUITY_EVENT,
+            decision="new",
+            reason=(
+                f"resume is off (engine={settings.engine}, "
+                f"history={settings.conversation_history})"
+            ),
+        )
         return None, None
 
     fingerprints = conversation_fingerprints(request.messages)
     matched = session_manager.find_resumable(fingerprints)
     if matched is None:
+        logger.info(
+            _CONTINUITY_EVENT,
+            decision="new",
+            reason="no live session matches this conversation",
+            message_count=len(request.messages),
+        )
         return None, None
 
     matched_session_id, _already_sent = matched
@@ -271,15 +306,21 @@ def _plan_conversation(
     )
     if not plan.resuming:
         logger.info(
-            "Not resuming this turn", reason=plan.reason, session_id=matched_session_id
+            _CONTINUITY_EVENT,
+            decision="new",
+            reason=plan.reason,
+            session_id=matched_session_id,
+            sdk_session_id=sdk_session_id,
         )
         return None, None
 
     logger.info(
-        "Resuming an existing Claude session",
+        _CONTINUITY_EVENT,
+        decision="resume",
+        reason=plan.reason,
         session_id=matched_session_id,
         sdk_session_id=sdk_session_id,
-        reason=plan.reason,
+        new_message_count=len(plan.consumed),
     )
     return plan, matched_session_id
 
@@ -1165,8 +1206,27 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
             engine_kwargs = {}
             if settings.engine == ENGINE_SDK and request.tools:
                 engine_kwargs["client_tools"] = request.tools
-            if turn_plan is not None and turn_plan.resuming:
+                required_tools = required_tool_names(request)
+                if required_tools:
+                    engine_kwargs["required_tool_names"] = required_tools
+            resuming_turn = turn_plan is not None and turn_plan.resuming
+            if resuming_turn:
                 engine_kwargs["resume"] = turn_plan.resume_session_id
+
+            # Says outright which of the two happened, next to the prompt size
+            # it implies: a resumed turn sends only the new messages, a new one
+            # sends the whole transcript.
+            logger.info(
+                "Running turn",
+                conversation="resumed" if resuming_turn else "new",
+                engine=settings.engine,
+                session_id=session_id,
+                resume_session_id=(
+                    turn_plan.resume_session_id if resuming_turn else None
+                ),
+                prompt_chars=len(user_prompt),
+                client_tool_count=len(request.tools or []),
+            )
 
             async def _start(prompt: str, **extra):
                 return await claude_manager.create_session(
@@ -1201,8 +1261,19 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                 )
                 session_manager.discard_ledger(session_id)
                 turn_plan = None
+                resuming_turn = False
                 engine_kwargs.pop("resume", None)
                 user_prompt, _ = _extract_prompts(request)
+                logger.info(
+                    "Running turn",
+                    conversation="new",
+                    engine=settings.engine,
+                    session_id=session_id,
+                    resume_session_id=None,
+                    prompt_chars=len(user_prompt),
+                    client_tool_count=len(request.tools or []),
+                    reason="resume was rejected, replaying the transcript",
+                )
                 claude_process = await _start(user_prompt, **engine_kwargs)
         except ClaudeSessionConflictError as e:
             logger.warning(

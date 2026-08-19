@@ -26,12 +26,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
-logger = structlog.get_logger()
+from claude_code_api.utils.tool_choice import (
+    normalize_tool_choice as _normalize_tool_choice,
+)
 
-# tool_choice values that mean "you must call a tool".
-FORCED_TOOL_CHOICES = {"required", "any"}
-# tool_choice values that mean "no tools at all".
-DISABLED_TOOL_CHOICES = {"none"}
+logger = structlog.get_logger()
 
 # Envelope key holding the calls. Deliberately the same name the client sees on
 # the way out: it is the name the model knows best for a list of
@@ -91,34 +90,6 @@ class ToolBridge:
     ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
         """Unpack the CLI's validated JSON result into (content, tool_calls)."""
         return convert_envelope(result_text, self)
-
-
-def _normalize_tool_choice(tool_choice: Any) -> Tuple[str, Optional[str]]:
-    """Return (mode, forced_name) where mode is 'none' | 'auto' | 'required'."""
-    if tool_choice is None:
-        return "auto", None
-
-    if isinstance(tool_choice, str):
-        value = tool_choice.strip().lower()
-        if value in DISABLED_TOOL_CHOICES:
-            return "none", None
-        if value in FORCED_TOOL_CHOICES:
-            return "required", None
-        return "auto", None
-
-    # Pydantic ToolChoice model or a raw dict from a lenient client.
-    function = getattr(tool_choice, "function", None)
-    if function is None and isinstance(tool_choice, dict):
-        function = tool_choice.get("function")
-
-    name = getattr(function, "name", None)
-    if name is None and isinstance(function, dict):
-        name = function.get("name")
-
-    if isinstance(name, str) and name:
-        return "required", name
-
-    return "auto", None
 
 
 def _normalize_tools(tools: Any) -> List[BridgedTool]:

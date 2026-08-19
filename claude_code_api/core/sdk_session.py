@@ -19,6 +19,7 @@ the tool bridge keep working unchanged and the two engines stay swappable.
 """
 
 import asyncio
+import inspect
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Sequence
 
 import structlog
@@ -32,6 +33,7 @@ from claude_code_api.utils.engine import (  # noqa: F401  (re-exported)
     normalize_engine,
 )
 
+from claude_code_api.utils.sdk_prompt import required_tool_nudge
 from claude_code_api.utils.sdk_tools import (
     CLIENT_TOOL_SERVER,
     build_client_tool_server,
@@ -141,6 +143,13 @@ def sdk_message_to_stream_dict(message: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+async def _emit(sink: Callable[[Dict[str, Any]], Any], payload: Dict[str, Any]) -> None:
+    """Hand one payload to a sink that may be synchronous or a coroutine."""
+    result = sink(payload)
+    if inspect.isawaitable(result):
+        await result
+
+
 class SdkSession:
     """One Agent SDK conversation, shaped like `ClaudeProcess`.
 
@@ -172,6 +181,9 @@ class SdkSession:
         self._abandon = asyncio.Event()
         self._tool_server: Any = None
         self._allowed_tools: List[str] = []
+        # Tools the caller demanded be called (tool_choice). Empty means a reply
+        # without a tool call is a legitimate answer.
+        self._required_tool_names: List[str] = []
 
     async def _record_tool_call(
         self, name: str, qualified: str, arguments: Dict[str, Any]
@@ -243,9 +255,11 @@ class SdkSession:
         effort: Optional[str] = None,
         client_tools: Optional[Sequence[Any]] = None,
         resume: Optional[str] = None,
+        required_tool_names: Optional[Sequence[str]] = None,
     ) -> bool:
         """Open an SDK session and begin draining it into `output_queue`."""
         self.last_error = None
+        self._required_tool_names = list(required_tool_names or [])
 
         if client_tools:
             self._tool_server, self._allowed_tools, names = build_client_tool_server(
@@ -269,7 +283,12 @@ class SdkSession:
                 project_path=self.project_path,
                 model=model or get_default_model(),
                 effort=effort or "<sdk-default>",
-                resuming=bool(resume),
+                # Which conversation Claude is being handed: one it already
+                # holds, or a fresh one.
+                conversation="resumed" if resume else "new",
+                resume_session_id=resume,
+                prompt_chars=len(prompt or ""),
+                required_tools=self._required_tool_names or None,
             )
 
             self._client = ClaudeSDKClient(options=options)
@@ -290,30 +309,84 @@ class SdkSession:
             )
             return False
 
-    async def _pump(self) -> None:
-        """Translate SDK messages onto the queue until the turn ends."""
-        try:
-            async for message in self._client.receive_response():
-                payload = sdk_message_to_stream_dict(message)
-                if payload is None:
-                    continue
+    async def _drain_turn(self, sink: Callable[[Dict[str, Any]], Any]) -> bool:
+        """Translate one turn's messages into `sink`.
 
-                if self._rewrite_client_tool_names(payload):
-                    # Claude asked the client to run a tool. The client owns
-                    # execution, so the turn ends here and the call travels
-                    # back over HTTP as OpenAI tool_calls.
-                    await self.output_queue.put(payload)
-                    await self.output_queue.put(self._tool_call_result(payload))
+        Returns True when Claude asked the client to run a tool, which ends the
+        turn: the client owns execution, so the call travels back over HTTP as
+        OpenAI tool_calls rather than being answered here.
+        """
+        async for message in self._client.receive_response():
+            payload = sdk_message_to_stream_dict(message)
+            if payload is None:
+                continue
+
+            if self._rewrite_client_tool_names(payload):
+                await _emit(sink, payload)
+                await _emit(sink, self._tool_call_result(payload))
+                return True
+
+            self._remember_session_id(payload)
+            await _emit(sink, payload)
+
+        return False
+
+    def _remember_session_id(self, payload: Dict[str, Any]) -> None:
+        """Record Claude's own session id the first time it appears."""
+        cli_session_id = payload.get("session_id")
+        if cli_session_id and not self.cli_session_id:
+            self.cli_session_id = cli_session_id
+            logger.info("Extracted SDK session ID", session_id=cli_session_id)
+            if self._on_cli_session_id:
+                self._on_cli_session_id(cli_session_id)
+
+    async def _pump(self) -> None:
+        """Translate SDK messages onto the queue until the turn ends.
+
+        With nothing demanded by `tool_choice` this is a straight passthrough.
+        With a demand, a turn that ends without the call is not an answer to the
+        request that was made, so it is held back and Claude is asked again in
+        the same session - an ordinary follow-up message, with the caller's
+        tools still registered exactly as they were. The final attempt is
+        released either way: a client that receives prose can at least see what
+        the model said, which beats an empty reply.
+        """
+        try:
+            attempts_left = (
+                settings.sdk_required_tool_attempts if self._required_tool_names else 0
+            )
+
+            while True:
+                if not self._required_tool_names:
+                    await self._drain_turn(self.output_queue.put)
                     break
 
-                cli_session_id = payload.get("session_id")
-                if cli_session_id and not self.cli_session_id:
-                    self.cli_session_id = cli_session_id
-                    logger.info("Extracted SDK session ID", session_id=cli_session_id)
-                    if self._on_cli_session_id:
-                        self._on_cli_session_id(cli_session_id)
+                # Buffered, because a turn that ignores the demand is discarded
+                # and must never reach the client as the answer.
+                held: List[Dict[str, Any]] = []
+                called = await self._drain_turn(held.append)
 
-                await self.output_queue.put(payload)
+                if called or attempts_left <= 0:
+                    if not called:
+                        logger.warning(
+                            "Turn ended without the required tool call and no "
+                            "attempts remain; releasing the reply as it stands",
+                            session_id=self.session_id,
+                            required_tools=self._required_tool_names,
+                        )
+                    for payload in held:
+                        await self.output_queue.put(payload)
+                    break
+
+                attempts_left -= 1
+                logger.warning(
+                    "Turn ended without the required tool call; asking again",
+                    session_id=self.session_id,
+                    required_tools=self._required_tool_names,
+                    attempts_left=attempts_left,
+                    discarded_messages=len(held),
+                )
+                await self._client.query(required_tool_nudge(self._required_tool_names))
         except Exception as e:
             self.last_error = str(e)
             logger.error(
@@ -462,6 +535,7 @@ class SdkManager:
         effort: Optional[str] = None,
         client_tools: Optional[Sequence[Any]] = None,
         resume: Optional[str] = None,
+        required_tool_names: Optional[Sequence[str]] = None,
     ) -> SdkSession:
         from .claude_manager import (
             ClaudeProcessStartError,
@@ -492,6 +566,7 @@ class SdkManager:
                 effort=effort,
                 client_tools=client_tools,
                 resume=resume,
+                required_tool_names=required_tool_names,
             )
             if not started:
                 raise ClaudeProcessStartError(

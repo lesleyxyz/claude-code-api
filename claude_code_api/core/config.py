@@ -177,6 +177,12 @@ class Settings(BaseSettings):
     def parse_engine(cls, v):
         return normalize_engine(v)
 
+    # How many extra attempts the SDK engine gets when the caller sent
+    # tool_choice="required" (or named a tool) and the model answered without
+    # calling it. Each retry is a follow-up message in the same session, so it
+    # costs a turn rather than a request. 0 disables retrying.
+    sdk_required_tool_attempts: int = 2
+
     # Conversation history
     # off      - last user message only (behaviour before history existed)
     # flatten  - render the whole message array into the prompt

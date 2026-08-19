@@ -195,6 +195,7 @@ class SdkSession:
         model: Optional[str],
         system_prompt: Optional[str],
         effort: Optional[str],
+        json_schema: Optional[Dict[str, Any]] = None,
     ) -> Any:
         from claude_agent_sdk import ClaudeAgentOptions
 
@@ -216,6 +217,14 @@ class SdkSession:
         if self._tool_server is not None:
             options["mcp_servers"] = {CLIENT_TOOL_SERVER: self._tool_server}
             options["allowed_tools"] = self._allowed_tools
+        if json_schema is not None:
+            # The SDK keeps its StructuredOutput tool available for this even
+            # though `tools` is empty, so the two do not conflict. Verified
+            # against SDK 0.2.140.
+            options["output_format"] = {
+                "type": "json_schema",
+                "schema": json_schema,
+            }
 
         return ClaudeAgentOptions(**options)
 
@@ -241,18 +250,12 @@ class SdkSession:
                 tool_names=names,
             )
 
-        # json_schema is accepted for signature parity with the CLI engine.
-        # Structured output moves to the SDK's own channel in a later stage.
-        if json_schema is not None:
-            logger.debug(
-                "SDK engine ignoring json_schema for now",
-                session_id=self.session_id,
-            )
-
         try:
             from claude_agent_sdk import ClaudeSDKClient
 
-            options = self._build_options(model, system_prompt, effort)
+            options = self._build_options(
+                model, system_prompt, effort, json_schema=json_schema
+            )
             logger.info(
                 "Starting Claude SDK session",
                 session_id=self.session_id,
@@ -316,22 +319,48 @@ class SdkSession:
                 self._on_end(self)
 
     def _rewrite_client_tool_names(self, payload: Dict[str, Any]) -> bool:
-        """Map mcp__client__foo back to foo. True if a client tool was called.
+        """Keep only the client's tool calls, under the client's own names.
 
-        The client declared `foo` and expects `foo` back; the MCP namespace is
-        an implementation detail of how it reached Claude.
+        Two jobs, both necessary:
+
+        * `mcp__client__foo` becomes `foo`. The client declared `foo` and
+          expects `foo` back; the MCP namespace is an implementation detail of
+          how the tool reached Claude.
+        * Every other tool_use block is dropped. Those are Claude's own - most
+          often `StructuredOutput`, which is how the SDK implements
+          `response_format` - and a client must never be handed a call to a
+          tool it did not declare. Filtering here rather than downstream is
+          what lets this engine surface client calls unconditionally: by the
+          time a message leaves the adapter, the only tool_use blocks left are
+          the caller's.
+
+        Returns True when the client is being asked to run something.
         """
         if payload.get("type") != "assistant":
             return False
 
-        found = False
-        for block in payload.get("message", {}).get("content", []) or []:
+        message = payload.get("message") or {}
+        blocks = message.get("content") or []
+        kept, found = [], False
+
+        for block in blocks:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
+                kept.append(block)
                 continue
+
             name = block.get("name", "")
             if is_client_tool(name):
                 block["name"] = local_name(name)
                 found = True
+                kept.append(block)
+            else:
+                logger.debug(
+                    "Dropping an internal tool call",
+                    session_id=self.session_id,
+                    tool=name,
+                )
+
+        message["content"] = kept
         return found
 
     def _tool_call_result(self, payload: Dict[str, Any]) -> Dict[str, Any]:

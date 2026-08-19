@@ -77,9 +77,10 @@ class OpenAIStreamConverter:
         self.tool_call_index = 0
         self.prefer_result_content = prefer_result_content
         self.tool_bridge = tool_bridge
-        self.suppress_internal_tools = (
-            suppress_internal_tools or prefer_result_content
-        )
+        # Decided by the caller, which knows which engine ran: on the CLI
+        # engine a tool_use block is one of Claude's built-ins, on the SDK
+        # engine it is the client's own tool and must survive.
+        self.suppress_internal_tools = suppress_internal_tools
 
     def _build_chunk(
         self, delta: Dict[str, Any], finish_reason: Optional[str] = None
@@ -518,14 +519,19 @@ def create_non_streaming_response(
         tool_calls = []
 
     if prefer_result_content:
-        # The schema-validated `result` payload is authoritative.
-        tool_calls = []
         result_content = _extract_result_content(messages)
         if tool_bridge is not None:
+            # The envelope is authoritative, including which calls it carries.
             bridged_content, tool_calls = tool_bridge.convert_result(result_content)
             complete_content = bridged_content or ""
         elif result_content is not None:
+            # A schema-validated payload replaces whatever the stream produced.
+            tool_calls = []
             complete_content = result_content.strip()
+        # With no result payload at all there is nothing authoritative to
+        # prefer, so the stream stands. That is the case when a turn ended
+        # early because a tool call went back to the client: blanking the
+        # calls here would return an empty response instead.
 
     logger.info(
         "Final response content",

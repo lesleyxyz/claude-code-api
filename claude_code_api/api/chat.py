@@ -224,19 +224,24 @@ def _apply_tool_bridge(
     )
 
 
-def _suppress_internal_tools(request: ChatCompletionRequest) -> bool:
+def _suppress_internal_tools(
+    request: ChatCompletionRequest, json_schema: Optional[Dict[str, Any]] = None
+) -> bool:
     """Whether tool_use blocks in the stream should be hidden from the client.
 
     On the CLI engine they are Claude's own built-ins - an implementation
-    detail the caller never declared - and the emulated call arrives separately
-    in the envelope, so they are hidden whenever the caller sent tools.
+    detail the caller never declared. They are hidden whenever the caller sent
+    tools (the emulated call arrives separately in the envelope) or asked for
+    structured output (the validated payload is the whole answer).
 
     On the SDK engine the caller's tools ARE registered with Claude, so a
-    tool_use block is exactly what the client asked for and must pass through.
+    tool_use block is exactly what the client asked for and must pass through -
+    including alongside a response_format, which is an independent channel
+    there rather than a competing one.
     """
     if settings.engine == ENGINE_SDK:
         return False
-    return bool(request.tools)
+    return bool(request.tools) or json_schema is not None
 
 
 def _extract_prompts(request: ChatCompletionRequest) -> Tuple[str, str]:
@@ -1152,7 +1157,9 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                     claude_process,
                     prefer_result_content=json_schema is not None,
                     tool_bridge=tool_bridge,
-                    suppress_internal_tools=_suppress_internal_tools(request),
+                    suppress_internal_tools=_suppress_internal_tools(
+                        request, json_schema
+                    ),
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -1172,7 +1179,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
             project_id=project_id,
             prefer_result_content=json_schema is not None,
             tool_bridge=tool_bridge,
-            suppress_internal_tools=_suppress_internal_tools(request),
+            suppress_internal_tools=_suppress_internal_tools(request, json_schema),
         )
         _warn_if_tools_went_unused(request, completion)
         return completion

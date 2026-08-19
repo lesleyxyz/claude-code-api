@@ -328,12 +328,71 @@ class TestInterception:
         assert session._rewrite_client_tool_names(payload) is True
         assert payload["message"]["content"][0]["name"] == "search_nodes"
 
-    def test_builtin_tool_is_not_treated_as_a_client_call(self):
+    def test_builtin_tool_call_is_dropped_entirely(self):
+        """A client must never be handed a call to a tool it did not declare."""
         session = self._session()
         payload = self._assistant_payload("Bash")
 
         assert session._rewrite_client_tool_names(payload) is False
-        assert payload["message"]["content"][0]["name"] == "Bash"
+        assert payload["message"]["content"] == []
+
+    def test_structured_output_call_is_dropped(self):
+        """Regression: response_format is implemented as a StructuredOutput tool.
+
+        Leaking it surfaced a bogus tool_call and turned a plain schema request
+        into finish_reason "tool_calls".
+        """
+        session = self._session()
+        payload = self._assistant_payload("StructuredOutput")
+
+        assert session._rewrite_client_tool_names(payload) is False
+        assert payload["message"]["content"] == []
+
+    def test_text_blocks_survive_the_filter(self):
+        session = self._session()
+        payload = {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "thinking out loud"},
+                    {"type": "tool_use", "id": "t", "name": "Bash", "input": {}},
+                ],
+            },
+        }
+
+        assert session._rewrite_client_tool_names(payload) is False
+        assert payload["message"]["content"] == [
+            {"type": "text", "text": "thinking out loud"}
+        ]
+
+    def test_client_call_survives_alongside_a_dropped_builtin(self):
+        session = self._session()
+        payload = {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "a",
+                        "name": "StructuredOutput",
+                        "input": {},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "b",
+                        "name": "mcp__client__search_nodes",
+                        "input": {"query": "slack"},
+                    },
+                ],
+            },
+        }
+
+        assert session._rewrite_client_tool_names(payload) is True
+        kept = payload["message"]["content"]
+        assert len(kept) == 1
+        assert kept[0]["name"] == "search_nodes"
 
     def test_text_only_message_is_not_an_interception(self):
         session = self._session()

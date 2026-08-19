@@ -5,6 +5,7 @@ This is a fork based on codingworkflow's claude-code-api with the following addi
 - Support for json_schema
 - Support for function tools
 - Support for multi-turn conversation history, including agent tool loops
+- Optional Claude Agent SDK engine (`ENGINE=sdk`) with native tool calling
 - Support for `/v1/responses` API
 - Support for reasoning/effort levels using both OpenAI/Anthropic enums
 - Daily docker builds for vulnerabilities at `ghcr.io/lesleyxyz/claude-code-api:latest`
@@ -196,6 +197,35 @@ Conversation history:
 | --- | --- | --- |
 | `CONVERSATION_HISTORY` | `flatten` | `off` sends only the last user message. `flatten` renders the whole array into the prompt. `resume` is reserved for reusing the CLI session. |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `200000` | Cap on the rendered history. Oldest messages are dropped first and the prompt says so; the newest turn is never truncated. `0` disables the cap. |
+
+Engine:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ENGINE` | `cli` | `cli` spawns `claude -p` per request and parses stream-json. `sdk` drives the Claude Agent SDK in-process. |
+
+The `sdk` engine registers the caller's `tools` with Claude as real in-process
+MCP tools instead of emulating them, which removes the envelope entirely:
+
+- a tool call arrives as a genuine tool use, so the model cannot fail to find a
+  tool that is actually in its toolset;
+- each tool keeps its own JSON Schema, instead of collapsing to
+  `additionalProperties: true` once there is more than one tool;
+- tool schemas no longer sit in the system prompt (10 n8n-sized tools cost about
+  56,000 characters there on the `cli` engine);
+- `tools` and `response_format` become independent channels, so a request can
+  get a tool call on one turn and a schema-conformant answer on the next. On the
+  `cli` engine the two compete for the same envelope and `response_format` is
+  dropped when a tool call is forced.
+
+Claude's own built-in tools are switched off on this engine, so only the
+caller's tools can run. Streaming, `/v1/responses`, `response_format`,
+conversation history and reasoning effort all work on both engines.
+
+Authentication follows the SDK: `ANTHROPIC_API_KEY` when set, otherwise the
+signed-in Claude Code session. Note that Anthropic's Agent SDK documentation
+states that third-party developers may not offer claude.ai login for their
+products without prior approval, and directs them to API key authentication.
 
 Large prompts:
 

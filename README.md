@@ -197,6 +197,17 @@ Conversation history:
 | `CONVERSATION_HISTORY` | `flatten` | `off` sends only the last user message. `flatten` renders the whole array into the prompt. `resume` is reserved for reusing the CLI session. |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `200000` | Cap on the rendered history. Oldest messages are dropped first and the prompt says so; the newest turn is never truncated. `0` disables the cap. |
 
+Large prompts:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PROMPT_FILE_DIR` | OS temp dir + `claude-code-api-prompts` | Scratch directory for per-request system prompt files. Keep it off any mounted volume: the files are short-lived and can hold sensitive text. |
+| `PROMPT_FILE_MAX_AGE_MINUTES` | `60` | Age at which an orphaned prompt file is swept at startup. Files are normally deleted when their process ends; this only catches hard crashes. |
+
+The conversation prompt is written to the CLI on stdin and the system prompt is
+passed via `--system-prompt-file`, so neither is limited by the operating
+system's command-line size (32 KB on Windows) nor visible in the process table.
+
 ## Bug Reports & Support
 
 For `claude-code-api` and `ai-code-fusion`, use this discussion thread for bug reports and troubleshooting:

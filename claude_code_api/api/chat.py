@@ -202,7 +202,7 @@ def _apply_tool_bridge(
 def _extract_prompts(request: ChatCompletionRequest) -> Tuple[str, str]:
     """Render the request into the (prompt, system prompt) pair the CLI takes.
 
-    System messages stay in --system-prompt rather than being folded into the
+    System messages stay in --system-prompt-file rather than being folded into the
     transcript: they are instructions, not conversation, and they need to stay
     adjacent to the tool-bridge block `_merge_system_prompt` appends.
     """

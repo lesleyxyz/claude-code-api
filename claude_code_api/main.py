@@ -5,6 +5,7 @@ A FastAPI-based service that provides OpenAI-compatible endpoints
 while leveraging Claude Code's powerful workflow capabilities.
 """
 
+import asyncio
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -20,7 +21,10 @@ from claude_code_api.api.models import router as models_router
 from claude_code_api.api.projects import router as projects_router
 from claude_code_api.api.sessions import router as sessions_router
 from claude_code_api.core.auth import auth_middleware
-from claude_code_api.core.claude_manager import ClaudeManager
+from claude_code_api.core.claude_manager import (
+    ClaudeManager,
+    sweep_stale_prompt_files,
+)
 from claude_code_api.core.config import settings
 from claude_code_api.core.database import close_database, create_tables
 from claude_code_api.core.logging_config import configure_logging
@@ -45,6 +49,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.session_manager = SessionManager()
     app.state.claude_manager = ClaudeManager()
     logger.info("Managers initialized", lifecycle=True)
+
+    # Prompt files are removed when their process ends; this only clears ones
+    # orphaned by a hard crash, so the scratch directory cannot grow forever.
+    await asyncio.to_thread(sweep_stale_prompt_files)
 
     # Verify Claude Code availability
     try:

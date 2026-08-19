@@ -2,7 +2,9 @@
 
 import asyncio
 import os
+import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -160,7 +162,7 @@ def test_redaction_keeps_secret_values_out_of_logs():
         [
             "claude",
             "-p",
-            "--system-prompt",
+            "--system-prompt-file",
             "SECRET SYSTEM PROMPT",
             "--json-schema",
             '{"secret": true}',
@@ -172,26 +174,177 @@ def test_redaction_keeps_secret_values_out_of_logs():
     assert "SECRET SYSTEM PROMPT" not in safe
     assert '{"secret": true}' not in safe
     # Flag names survive, so the log still shows the shape of the command.
-    assert "--system-prompt" in safe
+    assert "--system-prompt-file" in safe
     assert "--json-schema" in safe
     # Non-secret values are untouched.
     assert "claude-sonnet-4-5-20250929" in safe
 
 
+@pytest.fixture
+def prompt_dir(tmp_path, monkeypatch):
+    """Isolate the system-prompt scratch directory for a test."""
+    directory = tmp_path / "prompts"
+    monkeypatch.setattr(settings, "prompt_file_dir", str(directory))
+    return directory
+
+
 @pytest.mark.asyncio
-async def test_oversized_command_line_is_rejected(monkeypatch):
-    """A huge system prompt fails with a clear message, not a CreateProcess OSError."""
+async def test_oversized_command_line_is_rejected(monkeypatch, prompt_dir):
+    """A huge inline schema fails with a clear message, not a raw OSError.
+
+    The system prompt cannot trigger this any more - it goes to a file - so
+    the remaining oversize risk is --json-schema, which is inline-only.
+    """
     process = cm.ClaudeProcess(session_id="sess", project_path="/tmp")
     spawn_recorder(monkeypatch)
+    max_total, _ = cm._argv_limits()
 
     try:
         started = await process.start(
-            prompt="hi", system_prompt="x" * (cm._MAX_COMMAND_LINE_CHARS + 1)
+            prompt="hi", json_schema={"description": "x" * (max_total + 100)}
         )
         assert started is False
-        assert "over the" in (process.last_error or "")
+        assert "byte limit" in (process.last_error or "")
     finally:
         await process.stop()
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_is_passed_as_a_file(monkeypatch, prompt_dir):
+    """With tools in play the system prompt is the biggest argument there is."""
+    process = cm.ClaudeProcess(session_id="sess", project_path="/tmp")
+    calls = spawn_recorder(monkeypatch)
+    system_prompt = "SECRET SYSTEM PROMPT " * 50
+
+    try:
+        assert await process.start(prompt="hi", system_prompt=system_prompt) is True
+        argv = calls["argv"]
+
+        assert "--system-prompt" not in argv
+        path = flag_value(argv, "--system-prompt-file")
+        assert path is not None
+        assert system_prompt not in argv
+        # Scratch lives outside the project tree, so no Docker volume keeps it.
+        assert Path(path).parent == prompt_dir
+        assert Path(path).read_text(encoding="utf-8") == system_prompt
+    finally:
+        await process.stop()
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_file_is_removed_when_the_process_stops(
+    monkeypatch, prompt_dir
+):
+    process = cm.ClaudeProcess(session_id="sess", project_path="/tmp")
+    calls = spawn_recorder(monkeypatch)
+
+    assert await process.start(prompt="hi", system_prompt="secret") is True
+    path = Path(flag_value(calls["argv"], "--system-prompt-file"))
+
+    await process.stop()
+
+    assert not path.exists()
+    assert list(prompt_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_no_prompt_file_without_a_system_prompt(monkeypatch, prompt_dir):
+    process = cm.ClaudeProcess(session_id="sess", project_path="/tmp")
+    calls = spawn_recorder(monkeypatch)
+
+    try:
+        assert await process.start(prompt="hi") is True
+        assert "--system-prompt-file" not in calls["argv"]
+    finally:
+        await process.stop()
+
+
+def test_prompt_file_names_are_unique(prompt_dir):
+    """Concurrent sessions must not collide on a shared scratch directory."""
+    first = cm.write_system_prompt_file("one")
+    second = cm.write_system_prompt_file("two")
+
+    try:
+        assert first != second
+        assert Path(first).read_text(encoding="utf-8") == "one"
+        assert Path(second).read_text(encoding="utf-8") == "two"
+    finally:
+        cm.remove_system_prompt_file(first)
+        cm.remove_system_prompt_file(second)
+
+    assert list(prompt_dir.iterdir()) == []
+
+
+def test_remove_prompt_file_tolerates_a_missing_file(prompt_dir):
+    path = cm.write_system_prompt_file("gone")
+    cm.remove_system_prompt_file(path)
+    cm.remove_system_prompt_file(path)  # must not raise
+    cm.remove_system_prompt_file(None)
+
+
+def test_sweep_removes_only_stale_prompt_files(prompt_dir, monkeypatch):
+    """Files are normally removed with their process; this catches crashes."""
+    monkeypatch.setattr(settings, "prompt_file_max_age_minutes", 60)
+    stale = Path(cm.write_system_prompt_file("orphaned by a crash"))
+    fresh = Path(cm.write_system_prompt_file("still in use"))
+    unrelated = prompt_dir / "not-ours.txt"
+    unrelated.write_text("leave me alone", encoding="utf-8")
+
+    old = time.time() - 2 * 60 * 60
+    os.utime(stale, (old, old))
+
+    try:
+        assert cm.sweep_stale_prompt_files() == 1
+        assert not stale.exists()
+        assert fresh.exists()
+        assert unrelated.exists()
+    finally:
+        cm.remove_system_prompt_file(str(fresh))
+
+
+def test_sweep_is_safe_when_the_directory_is_absent(prompt_dir):
+    assert not prompt_dir.exists()
+    assert cm.sweep_stale_prompt_files() == 0
+
+
+def test_argv_limits_are_platform_specific():
+    """Regression: a Windows-sized cap was once applied on Linux, where a
+    56KB command line is perfectly legal, and it broke real requests."""
+    max_total, max_single = cm._argv_limits()
+
+    if os.name == "nt":
+        assert max_total <= 32767
+    else:
+        # Comfortably above anything the tool bridge realistically produces.
+        assert max_total >= 200_000
+        assert max_single >= 120_000
+
+
+def test_a_realistic_tool_bridge_command_is_not_rejected():
+    """56KB of system prompt + schema is normal for a multi-tool request."""
+    cmd = [
+        "claude",
+        "-p",
+        "--system-prompt",
+        "x" * 50_000,
+        "--json-schema",
+        "y" * 6_000,
+    ]
+    reason = cm._oversize_reason(cmd)
+
+    if os.name == "nt":
+        assert reason is not None  # genuinely impossible on Windows
+    else:
+        assert reason is None
+
+
+def test_oversize_reason_counts_bytes_not_characters():
+    """Multi-byte UTF-8 must count as the bytes execve actually copies."""
+    max_total, _ = cm._argv_limits()
+    # Each character is 3 bytes in UTF-8, so this is over on byte count while
+    # its character count stays under the limit.
+    payload = "中" * (max_total // 2)
+    assert cm._oversize_reason(["claude", payload]) is not None
 
 
 @pytest.mark.asyncio

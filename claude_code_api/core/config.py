@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import tempfile
 from typing import List
 
 from pydantic import Field, field_validator
@@ -67,6 +68,17 @@ def default_project_root() -> str:
 def default_session_map_path() -> str:
     """Default path for CLI-to-API session mapping."""
     return os.path.join(os.getcwd(), "claude_sessions", "session_map.json")
+
+
+def default_prompt_file_dir() -> str:
+    """Scratch directory for per-request system prompt files.
+
+    Deliberately under the OS temp directory rather than the project tree: in
+    the Docker image every project path is a bind mount, and these files are
+    short-lived scratch that must not survive into a mounted volume. /tmp is
+    container-local and is discarded with the container.
+    """
+    return os.path.join(tempfile.gettempdir(), "claude-code-api-prompts")
 
 
 def default_log_file_path() -> str:
@@ -173,6 +185,12 @@ class Settings(BaseSettings):
     max_project_size_mb: int = 1000
     cleanup_interval_minutes: int = 60
     session_map_path: str = default_session_map_path()
+    # System prompts are handed to the CLI as files, not argv. Keep this
+    # off any mounted volume: it is scratch, and it can hold sensitive text.
+    prompt_file_dir: str = default_prompt_file_dir()
+    # Age at which an orphaned prompt file is swept, in minutes. Files are
+    # normally deleted when their process ends; this catches hard crashes.
+    prompt_file_max_age_minutes: int = 60
 
     # Database Configuration
     database_url: str = "sqlite:///./claude_api.db"

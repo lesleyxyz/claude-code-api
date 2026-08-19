@@ -4,8 +4,11 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
+import time
+import uuid
 from collections import deque
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 
 import structlog
 
@@ -21,12 +24,118 @@ logger = structlog.get_logger()
 # deliberately absent: the prompt is delivered on stdin, so it has no argv value
 # to redact, and listing it here would consume the following flag NAME as its
 # value and leak that flag's own value in the clear.
-_SECRET_VALUE_FLAGS = ("--system-prompt", "--json-schema")
+_SECRET_VALUE_FLAGS = ("--system-prompt-file", "--json-schema")
 
-# Windows caps an entire command line at 32767 characters. The prompt is on
-# stdin, but --system-prompt and --json-schema can still be large: the tool
-# bridge embeds every tool's full JSON Schema.
-_MAX_COMMAND_LINE_CHARS = 30000
+
+def write_system_prompt_file(system_prompt: str) -> str:
+    """Write a system prompt to its own file and return the path.
+
+    The prompt carries the whole tool bridge - every client tool's full JSON
+    Schema - so inline it is by far the largest argument and the one that
+    blows the Windows command-line limit. A file keeps argv small regardless
+    of how many tools a client declares, and keeps the prompt out of the
+    process table.
+
+    The name is a fresh UUID so concurrent sessions cannot collide, and the
+    file is created with O_EXCL and mode 0600 so there is no window in which
+    it exists with wider permissions.
+    """
+    directory = settings.prompt_file_dir
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"system-prompt-{uuid.uuid4().hex}.txt")
+
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(system_prompt)
+    return path
+
+
+def remove_system_prompt_file(path: Optional[str]) -> None:
+    """Delete a prompt file, tolerating it already being gone."""
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning("Failed to remove system prompt file", path=path, error=str(e))
+
+
+def sweep_stale_prompt_files() -> int:
+    """Delete prompt files left behind by a crash. Returns how many went.
+
+    Normal operation removes each file when its process ends; this only
+    matters when the gateway died between spawning and cleanup.
+    """
+    directory = settings.prompt_file_dir
+    if not os.path.isdir(directory):
+        return 0
+
+    cutoff = time.time() - settings.prompt_file_max_age_minutes * 60
+    removed = 0
+    try:
+        names = os.listdir(directory)
+    except OSError as e:
+        logger.warning("Failed to sweep prompt files", path=directory, error=str(e))
+        return 0
+
+    for name in names:
+        if not name.startswith("system-prompt-"):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            logger.warning(
+                "Failed to remove stale prompt file", path=path, error=str(e)
+            )
+
+    if removed:
+        logger.info("Swept stale system prompt files", removed=removed)
+    return removed
+
+
+def _argv_limits() -> Tuple[int, int]:
+    """(max total, max single argument) in BYTES for this platform.
+
+    Bytes, not characters: the payload is UTF-8 JSON that routinely carries
+    non-ASCII. These are per-OS and wildly different, so a single number would
+    either reject valid Linux command lines or miss real Windows failures.
+    """
+    if os.name == "nt":
+        # CreateProcess caps the whole command line at 32767 characters,
+        # including the quoting subprocess adds around each argument.
+        return 31000, 31000
+    if sys.platform == "darwin":
+        # ARG_MAX is 256 KiB and covers argv plus the environment block.
+        return 200_000, 200_000
+    # Linux: MAX_ARG_STRLEN caps a *single* argument at 128 KiB, while ARG_MAX
+    # (argv plus environment) is typically 2 MiB. Leave room for the env.
+    return 1_000_000, 120_000
+
+
+def _oversize_reason(cmd: List[str]) -> Optional[str]:
+    """Why the OS would refuse to spawn this command, or None if it would not."""
+    max_total, max_single = _argv_limits()
+    sizes = [len(part.encode("utf-8")) for part in cmd]
+    # One extra byte per argument for the separator/terminator.
+    total = sum(sizes) + len(sizes)
+
+    if total > max_total:
+        return f"the command line is {total} bytes, over the {max_total} byte limit"
+
+    largest = max(sizes, default=0)
+    if largest > max_single:
+        return (
+            f"one argument is {largest} bytes, over the "
+            f"{max_single} byte per-argument limit"
+        )
+    return None
 
 
 def _redact_command(cmd: List[str]) -> List[str]:
@@ -41,10 +150,6 @@ def _redact_command(cmd: List[str]) -> List[str]:
         safe_cmd.append(part)
         redact_next = part in _SECRET_VALUE_FLAGS
     return safe_cmd
-
-
-def _command_line_length(cmd: List[str]) -> int:
-    return sum(len(part) + 1 for part in cmd)
 
 
 class ClaudeProcess:
@@ -69,6 +174,7 @@ class ClaudeProcess:
         self._on_cli_session_id = on_cli_session_id
         self._on_end = on_end
         self.last_error: Optional[str] = None
+        self._system_prompt_path: Optional[str] = None
         self._stderr_tail: deque[str] = deque(maxlen=20)
 
     async def start(
@@ -91,7 +197,13 @@ class ClaudeProcess:
             cmd.append("-p")
 
             if system_prompt:
-                cmd.extend(["--system-prompt", system_prompt])
+                # Via a file, not argv: with tools in play this string carries
+                # every tool's JSON Schema and is the dominant contributor to
+                # the command-line length.
+                self._system_prompt_path = await asyncio.to_thread(
+                    write_system_prompt_file, system_prompt
+                )
+                cmd.extend(["--system-prompt-file", self._system_prompt_path])
 
             if model:
                 cmd.extend(["--model", model])
@@ -126,12 +238,13 @@ class ClaudeProcess:
 
             # Start process from src directory (where Claude works without API key)
             src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            command_length = _command_line_length(cmd)
-            if command_length > _MAX_COMMAND_LINE_CHARS:
+            oversize = _oversize_reason(cmd)
+            if oversize:
                 raise ClaudeProcessStartError(
-                    f"Claude command line is {command_length} characters, over "
-                    f"the {_MAX_COMMAND_LINE_CHARS} limit. Reduce the system "
-                    "prompt or the number of tools."
+                    f"Claude cannot be started on {sys.platform} because "
+                    f"{oversize}. This is nearly always an oversized system "
+                    "prompt or tool schema: reduce the number of tools or the "
+                    "size of their JSON Schemas."
                 )
 
             safe_cmd = _redact_command(cmd)
@@ -252,6 +365,9 @@ class ClaudeProcess:
             logger.info(
                 "Claude process output stream ended", session_id=self.session_id
             )
+            # The CLI reads the system prompt at startup, so by the time its
+            # output ends the file is certainly no longer needed.
+            self._discard_prompt_file()
             if self._on_end:
                 self._on_end(self)
 
@@ -339,9 +455,16 @@ class ClaudeProcess:
                     "Error sending input", session_id=self.session_id, error=str(e)
                 )
 
+    def _discard_prompt_file(self) -> None:
+        """Remove this process's system prompt file, at most once."""
+        if self._system_prompt_path:
+            remove_system_prompt_file(self._system_prompt_path)
+            self._system_prompt_path = None
+
     async def stop(self):
         """Stop Claude process."""
         self.is_running = False
+        self._discard_prompt_file()
 
         for task in (self._output_task, self._error_task):
             if task and not task.done():

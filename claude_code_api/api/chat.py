@@ -5,7 +5,7 @@ import json
 import re
 from types import SimpleNamespace
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import structlog
 from fastapi import APIRouter, HTTPException, Request, status
@@ -27,6 +27,10 @@ from claude_code_api.models.openai import (
     ErrorResponse,
     ResponsesCreateRequest,
     ResponsesResponse,
+    ToolChoice,
+    ToolChoiceFunction,
+    ToolDefinition,
+    ToolFunction,
 )
 from claude_code_api.utils.parser import (
     ClaudeOutputParser,
@@ -496,6 +500,29 @@ def _responses_input_to_chat_messages(input_value: Any) -> List[Dict[str, Any]]:
             )
 
         item_type = item.get("type")
+
+        if item_type == "function_call":
+            # The model's own previous tool call. Chat Completions carries it as
+            # an assistant message, and parallel calls share one message, so a
+            # run of these items folds into the message the first one opened.
+            call = _responses_function_call_to_chat(item, location)
+            if messages and messages[-1].get("_from_function_call"):
+                messages[-1]["tool_calls"].append(call)
+            else:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call],
+                        "_from_function_call": True,
+                    }
+                )
+            continue
+
+        if item_type == "function_call_output":
+            messages.append(_responses_function_output_to_chat(item, location))
+            continue
+
         if item_type not in (None, "message"):
             raise _input_error(
                 f"Unsupported input item type at {location}: {item_type!r}.",
@@ -512,7 +539,86 @@ def _responses_input_to_chat_messages(input_value: Any) -> List[Dict[str, Any]]:
 
         messages.append(message)
 
+    for message in messages:
+        message.pop("_from_function_call", None)
+
     return messages
+
+
+def _responses_required_field(item: Dict[str, Any], field: str, location: str) -> str:
+    value = item.get(field)
+    if not isinstance(value, str) or not value:
+        raise _input_error(
+            f"Item at {location} is missing a valid {field!r}.",
+            "invalid_input_item",
+        )
+    return value
+
+
+def _responses_function_call_to_chat(
+    item: Dict[str, Any], location: str
+) -> Dict[str, Any]:
+    """One `function_call` input item as a Chat Completions tool call."""
+    arguments = item.get("arguments")
+    return {
+        "id": _responses_required_field(item, "call_id", location),
+        "type": "function",
+        "function": {
+            "name": _responses_required_field(item, "name", location),
+            # Both APIs carry arguments as a JSON string, so it is passed
+            # through rather than parsed and re-encoded.
+            "arguments": arguments if isinstance(arguments, str) else "{}",
+        },
+    }
+
+
+def _responses_function_output_to_chat(
+    item: Dict[str, Any], location: str
+) -> Dict[str, Any]:
+    """One `function_call_output` input item as a Chat Completions tool message."""
+    output = item.get("output")
+    return {
+        "role": "tool",
+        "tool_call_id": _responses_required_field(item, "call_id", location),
+        "content": output if isinstance(output, str) else json.dumps(output),
+    }
+
+
+def _responses_tools_to_chat_tools(
+    tools: Optional[List[Any]],
+) -> Optional[List[ToolDefinition]]:
+    """Flattened Responses tools as the nested Chat Completions equivalents."""
+    if not tools:
+        return None
+
+    converted = [
+        ToolDefinition(
+            function=ToolFunction(
+                name=tool.name,
+                description=tool.description,
+                parameters=tool.parameters,
+            )
+        )
+        for tool in tools
+    ]
+    return converted or None
+
+
+def _responses_tool_choice_to_chat(
+    tool_choice: Any,
+) -> Optional[Union[str, ToolChoice]]:
+    """A Responses `tool_choice` as the Chat Completions equivalent.
+
+    The strings are identical in both APIs; only the named form differs, having
+    no `function` wrapper there.
+    """
+    if tool_choice is None or isinstance(tool_choice, str):
+        return tool_choice
+
+    name = getattr(tool_choice, "name", None)
+    if isinstance(name, str) and name:
+        return ToolChoice(function=ToolChoiceFunction(name=name))
+    return None
 
 
 def _responses_request_to_chat_request(
@@ -531,6 +637,9 @@ def _responses_request_to_chat_request(
         session_id=request.session_id,
         system_prompt=system_prompt,
         reasoning_effort=request.reasoning.effort if request.reasoning else None,
+        tools=_responses_tools_to_chat_tools(request.tools),
+        tool_choice=_responses_tool_choice_to_chat(request.tool_choice),
+        parallel_tool_calls=request.parallel_tool_calls,
     )
 
 
@@ -551,6 +660,75 @@ def _extract_chat_response_text(chat_response: Dict[str, Any]) -> str:
     return str(content)
 
 
+def _extract_chat_response_tool_calls(
+    chat_response: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    choices = chat_response.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return []
+
+    message = choices[0].get("message") or {}
+    if not isinstance(message, dict):
+        return []
+
+    calls = message.get("tool_calls") or []
+    return [call for call in calls if isinstance(call, dict)]
+
+
+def _responses_message_item(message_id: str, output_text: str) -> Dict[str, Any]:
+    return {
+        "id": message_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "output_text",
+                "text": output_text,
+                "annotations": [],
+            }
+        ],
+    }
+
+
+def _responses_function_call_item(
+    call: Dict[str, Any], item_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """One Chat Completions tool call as a Responses `function_call` item.
+
+    `call_id` keeps the chat call's own id, so the id the client quotes back in
+    a `function_call_output` item is the one the tool message needs.
+    """
+    function = call.get("function") or {}
+    return {
+        "id": item_id or f"fc_{uuid.uuid4().hex}",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": call.get("id") or f"call_{uuid.uuid4().hex}",
+        "name": function.get("name") or "",
+        "arguments": function.get("arguments") or "{}",
+    }
+
+
+def _responses_output_items(
+    message_id: str,
+    output_text: str,
+    tool_calls: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """The `output` array, shared by the streaming and non-streaming paths.
+
+    A message item is emitted whenever there is text, and for a turn with no
+    tool calls even when the text is empty - that empty message is what a
+    text-only client expects to find. A turn that only calls tools carries just
+    the calls, which is what the Responses API does.
+    """
+    items: List[Dict[str, Any]] = []
+    if output_text or not tool_calls:
+        items.append(_responses_message_item(message_id, output_text))
+    items.extend(_responses_function_call_item(call) for call in tool_calls)
+    return items
+
+
 def _responses_usage_from_chat(chat_response: Dict[str, Any]) -> Dict[str, Any]:
     usage = chat_response.get("usage") or {}
     if not isinstance(usage, dict):
@@ -569,6 +747,7 @@ def _chat_response_to_responses_response(
     created_at = chat_response.get("created") or utc_timestamp()
     completed_at = utc_timestamp()
     output_text = _extract_chat_response_text(chat_response)
+    tool_calls = _extract_chat_response_tool_calls(chat_response)
 
     return {
         "id": f"resp_{uuid.uuid4().hex}",
@@ -581,21 +760,9 @@ def _chat_response_to_responses_response(
         "instructions": None,
         "max_output_tokens": request.max_output_tokens,
         "model": chat_response.get("model") or request.model,
-        "output": [
-            {
-                "id": f"msg_{uuid.uuid4().hex}",
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": output_text,
-                        "annotations": [],
-                    }
-                ],
-            }
-        ],
+        "output": _responses_output_items(
+            f"msg_{uuid.uuid4().hex}", output_text, tool_calls
+        ),
         "output_text": output_text,
         "usage": _responses_usage_from_chat(chat_response),
     }
@@ -661,6 +828,7 @@ def _responses_completed_payload(
     request: ResponsesCreateRequest,
     model: str,
     output_text: str,
+    output_items: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     return {
         "id": response_id,
@@ -673,21 +841,11 @@ def _responses_completed_payload(
         "instructions": None,
         "max_output_tokens": request.max_output_tokens,
         "model": model,
-        "output": [
-            {
-                "id": message_id,
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": output_text,
-                        "annotations": [],
-                    }
-                ],
-            }
-        ],
+        "output": (
+            output_items
+            if output_items is not None
+            else _responses_output_items(message_id, output_text, [])
+        ),
         "output_text": output_text,
         "usage": {
             "input_tokens": None,
@@ -707,6 +865,14 @@ async def _create_responses_sse_from_chat_stream(
     model = request.model
     output_parts: List[str] = []
     content_started = False
+    message_index: Optional[int] = None
+    # Tool calls by the index the chat stream gave them, so a call delivered in
+    # fragments accumulates rather than opening a second item.
+    calls: Dict[Any, Dict[str, Any]] = {}
+    # Completed items paired with the output index they were announced at, so
+    # the terminal payload reports them in that order.
+    indexed_items: List[Tuple[int, Dict[str, Any]]] = []
+    next_index = 0
 
     yield _responses_stream_event(
         "response.created",
@@ -718,19 +884,6 @@ async def _create_responses_sse_from_chat_stream(
                 "status": "in_progress",
                 "model": model,
             }
-        },
-    )
-    yield _responses_stream_event(
-        "response.output_item.added",
-        {
-            "output_index": 0,
-            "item": {
-                "id": message_id,
-                "type": "message",
-                "status": "in_progress",
-                "role": "assistant",
-                "content": [],
-            },
         },
     )
 
@@ -760,17 +913,85 @@ async def _create_responses_sse_from_chat_stream(
 
             choice = choices[0]
             delta = choice.get("delta") or {}
+
+            for raw_call in delta.get("tool_calls") or []:
+                if not isinstance(raw_call, dict):
+                    continue
+
+                key = raw_call.get("index")
+                if key is None:
+                    key = f"_unindexed_{len(calls)}"
+                function = raw_call.get("function") or {}
+                entry = calls.get(key)
+
+                if entry is None:
+                    entry = {
+                        "item_id": f"fc_{uuid.uuid4().hex}",
+                        "output_index": next_index,
+                        "call": {
+                            "id": raw_call.get("id"),
+                            "function": {
+                                "name": function.get("name") or "",
+                                "arguments": "",
+                            },
+                        },
+                    }
+                    next_index += 1
+                    calls[key] = entry
+                    yield _responses_stream_event(
+                        "response.output_item.added",
+                        {
+                            "output_index": entry["output_index"],
+                            "item": {
+                                **_responses_function_call_item(
+                                    entry["call"], item_id=entry["item_id"]
+                                ),
+                                "status": "in_progress",
+                                "arguments": "",
+                            },
+                        },
+                    )
+                elif function.get("name"):
+                    entry["call"]["function"]["name"] = function["name"]
+
+                argument_delta = function.get("arguments")
+                if argument_delta:
+                    entry["call"]["function"]["arguments"] += str(argument_delta)
+                    yield _responses_stream_event(
+                        "response.function_call_arguments.delta",
+                        {
+                            "item_id": entry["item_id"],
+                            "output_index": entry["output_index"],
+                            "delta": str(argument_delta),
+                        },
+                    )
+
             text_delta = delta.get("content")
             if not text_delta:
                 continue
 
             if not content_started:
                 content_started = True
+                message_index = next_index
+                next_index += 1
+                yield _responses_stream_event(
+                    "response.output_item.added",
+                    {
+                        "output_index": message_index,
+                        "item": {
+                            "id": message_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    },
+                )
                 yield _responses_stream_event(
                     "response.content_part.added",
                     {
                         "item_id": message_id,
-                        "output_index": 0,
+                        "output_index": message_index,
                         "content_index": 0,
                         "part": {
                             "type": "output_text",
@@ -785,69 +1006,97 @@ async def _create_responses_sse_from_chat_stream(
                 "response.output_text.delta",
                 {
                     "item_id": message_id,
-                    "output_index": 0,
+                    "output_index": message_index,
                     "content_index": 0,
                     "delta": str(text_delta),
                 },
             )
 
         output_text = "".join(output_parts)
-        if not content_started:
+
+        for entry in calls.values():
+            item = _responses_function_call_item(
+                entry["call"], item_id=entry["item_id"]
+            )
             yield _responses_stream_event(
-                "response.content_part.added",
+                "response.function_call_arguments.done",
+                {
+                    "item_id": entry["item_id"],
+                    "output_index": entry["output_index"],
+                    "arguments": item["arguments"],
+                },
+            )
+            yield _responses_stream_event(
+                "response.output_item.done",
+                {"output_index": entry["output_index"], "item": item},
+            )
+            indexed_items.append((entry["output_index"], item))
+
+        # A turn with no text and no tool calls still owes the client an item,
+        # so the empty message the text-only path always produced is kept.
+        if content_started or not calls:
+            if not content_started:
+                message_index = next_index
+                next_index += 1
+                yield _responses_stream_event(
+                    "response.output_item.added",
+                    {
+                        "output_index": message_index,
+                        "item": {
+                            "id": message_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    },
+                )
+                yield _responses_stream_event(
+                    "response.content_part.added",
+                    {
+                        "item_id": message_id,
+                        "output_index": message_index,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                        },
+                    },
+                )
+
+            yield _responses_stream_event(
+                "response.output_text.done",
                 {
                     "item_id": message_id,
-                    "output_index": 0,
+                    "output_index": message_index,
+                    "content_index": 0,
+                    "text": output_text,
+                },
+            )
+            yield _responses_stream_event(
+                "response.content_part.done",
+                {
+                    "item_id": message_id,
+                    "output_index": message_index,
                     "content_index": 0,
                     "part": {
                         "type": "output_text",
-                        "text": "",
+                        "text": output_text,
                         "annotations": [],
                     },
                 },
             )
+            message_item = _responses_message_item(message_id, output_text)
+            yield _responses_stream_event(
+                "response.output_item.done",
+                {"output_index": message_index, "item": message_item},
+            )
+            indexed_items.append((message_index, message_item))
 
-        yield _responses_stream_event(
-            "response.output_text.done",
-            {
-                "item_id": message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "text": output_text,
-            },
-        )
-        yield _responses_stream_event(
-            "response.content_part.done",
-            {
-                "item_id": message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "part": {
-                    "type": "output_text",
-                    "text": output_text,
-                    "annotations": [],
-                },
-            },
-        )
-        yield _responses_stream_event(
-            "response.output_item.done",
-            {
-                "output_index": 0,
-                "item": {
-                    "id": message_id,
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": output_text,
-                            "annotations": [],
-                        }
-                    ],
-                },
-            },
-        )
+        output_items = [
+            item for _, item in sorted(indexed_items, key=lambda pair: pair[0])
+        ]
 
         completed_at = utc_timestamp()
         yield _responses_stream_event(
@@ -861,6 +1110,7 @@ async def _create_responses_sse_from_chat_stream(
                     request=request,
                     model=model,
                     output_text=output_text,
+                    output_items=output_items,
                 )
             },
         )

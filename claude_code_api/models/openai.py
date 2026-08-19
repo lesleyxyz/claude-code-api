@@ -283,6 +283,50 @@ class Reasoning(BaseModel):
     )
 
 
+class ResponsesToolFunction(BaseModel):
+    """A function tool, in the Responses API's flattened shape.
+
+    Chat Completions nests the same fields under `function`; the Responses API
+    puts them on the tool itself. `_responses_tools_to_chat_tools` converts one
+    into the other so only the chat models reach the engine.
+    """
+
+    type: Literal["function"] = Field("function", description="Tool type")
+    name: str = Field(..., description="The name of the function to call")
+    description: Optional[str] = Field(None, description="The function description")
+    parameters: Optional[Dict[str, Any]] = Field(
+        None, description="JSON schema for the function parameters"
+    )
+    strict: Optional[bool] = Field(
+        None, description="Whether to enforce the parameter schema strictly"
+    )
+
+
+class ResponsesToolChoiceFunction(BaseModel):
+    """A named tool choice, flattened the same way as the tool definitions."""
+
+    type: Literal["function"] = Field("function", description="Tool choice type")
+    name: str = Field(..., description="Name of the function to call")
+
+
+class ResponsesFunctionCall(BaseModel):
+    """Responses API output item for a tool call the caller must run."""
+
+    id: str = Field(..., description="Output item ID")
+    type: Literal["function_call"] = Field(
+        "function_call", description=OBJECT_TYPE_DESC
+    )
+    status: Literal["completed"] = Field("completed", description="Item status")
+    call_id: str = Field(
+        ...,
+        description=(
+            "ID to quote back in a `function_call_output` item with the result"
+        ),
+    )
+    name: str = Field(..., description="Name of the function to call")
+    arguments: str = Field(..., description="JSON-encoded arguments string")
+
+
 class ResponsesCreateRequest(BaseModel):
     """Minimal OpenAI Responses API request model."""
 
@@ -303,6 +347,19 @@ class ResponsesCreateRequest(BaseModel):
     reasoning: Optional[Reasoning] = Field(
         None, description="Reasoning configuration (only `effort` is honoured)"
     )
+    tools: Optional[List[ResponsesToolFunction]] = Field(
+        None, description="Function tools the model may call"
+    )
+    tool_choice: Optional[Union[str, ResponsesToolChoiceFunction]] = Field(
+        None,
+        description=(
+            "'auto', 'none', 'required', or a named function tool. Honoured on "
+            "the same terms as the Chat Completions field."
+        ),
+    )
+    parallel_tool_calls: Optional[bool] = Field(
+        None, description="Whether the model may request several tools at once"
+    )
 
     # Extension fields for Claude Code
     project_id: Optional[str] = Field(
@@ -316,9 +373,7 @@ class ResponsesCreateRequest(BaseModel):
 class ResponsesOutputText(BaseModel):
     """Responses API output text content block."""
 
-    type: Literal["output_text"] = Field(
-        "output_text", description=OBJECT_TYPE_DESC
-    )
+    type: Literal["output_text"] = Field("output_text", description=OBJECT_TYPE_DESC)
     text: str = Field(..., description="Assistant output text")
     annotations: List[Any] = Field(
         default_factory=list, description="Output text annotations"
@@ -366,8 +421,11 @@ class ResponsesResponse(BaseModel):
         None, description="Maximum number of output tokens requested"
     )
     model: str = Field(..., description="Model used for the response")
-    output: List[ResponsesOutputMessage] = Field(
-        ..., description="Response output items"
+    output: List[Union[ResponsesOutputMessage, ResponsesFunctionCall]] = Field(
+        ...,
+        description=(
+            "Response output items: an assistant message, tool calls to run, " "or both"
+        ),
     )
     output_text: str = Field(..., description="Concatenated assistant output text")
     usage: ResponsesUsage = Field(..., description="Token usage")

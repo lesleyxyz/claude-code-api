@@ -7,6 +7,11 @@ from typing import List
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from claude_code_api.utils.history import (
+    HISTORY_MODE_FLATTEN,
+    normalize_history_mode,
+)
+
 
 def find_claude_binary() -> str:
     """Find Claude binary path automatically."""
@@ -149,6 +154,19 @@ class Settings(BaseSettings):
     default_model: str = "claude-sonnet-4-5-20250929"
     max_concurrent_sessions: int = 10
     session_timeout_minutes: int = 30
+
+    # Conversation history
+    # off      - last user message only (behaviour before history existed)
+    # flatten  - render the whole message array into the prompt
+    # resume   - reuse the CLI session, falling back to flatten
+    conversation_history: str = HISTORY_MODE_FLATTEN
+    # 0 disables the cap. 200k chars is roughly 50k tokens, which leaves
+    # room for the system prompt, both schemas and the answer.
+    conversation_history_max_chars: int = 200_000
+
+    @field_validator("conversation_history", mode="before")
+    def parse_conversation_history(cls, v):
+        return normalize_history_mode(v)
 
     # Project Configuration
     project_root: str = default_project_root()

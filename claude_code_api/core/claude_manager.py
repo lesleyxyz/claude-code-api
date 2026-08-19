@@ -17,6 +17,36 @@ from .security import ensure_directory_within_base
 logger = structlog.get_logger()
 
 
+# Flags whose *value* is sensitive and must never reach the logs. `-p` is
+# deliberately absent: the prompt is delivered on stdin, so it has no argv value
+# to redact, and listing it here would consume the following flag NAME as its
+# value and leak that flag's own value in the clear.
+_SECRET_VALUE_FLAGS = ("--system-prompt", "--json-schema")
+
+# Windows caps an entire command line at 32767 characters. The prompt is on
+# stdin, but --system-prompt and --json-schema can still be large: the tool
+# bridge embeds every tool's full JSON Schema.
+_MAX_COMMAND_LINE_CHARS = 30000
+
+
+def _redact_command(cmd: List[str]) -> List[str]:
+    """Copy of a command with sensitive flag values replaced."""
+    safe_cmd: List[str] = []
+    redact_next = False
+    for part in cmd:
+        if redact_next:
+            safe_cmd.append("<redacted>")
+            redact_next = False
+            continue
+        safe_cmd.append(part)
+        redact_next = part in _SECRET_VALUE_FLAGS
+    return safe_cmd
+
+
+def _command_line_length(cmd: List[str]) -> int:
+    return sum(len(part) + 1 for part in cmd)
+
+
 class ClaudeProcess:
     """Manages a single Claude Code process."""
 
@@ -54,7 +84,11 @@ class ClaudeProcess:
         try:
             # Prepare real command - using exact format from working Claudia example
             cmd = [settings.claude_binary_path]
-            cmd.extend(["-p", prompt])
+            # No positional prompt: the CLI reads it from stdin until EOF. That
+            # keeps an arbitrarily long conversation out of argv, where Windows
+            # caps the command line at 32767 chars, and out of the process
+            # table, where `ps` would otherwise show it in the clear.
+            cmd.append("-p")
 
             if system_prompt:
                 cmd.extend(["--system-prompt", system_prompt])
@@ -77,6 +111,7 @@ class ClaudeProcess:
                     "stream-json",
                     "--verbose",
                     "--safe-mode",
+                    "--no-chrome",
                     "--dangerously-skip-permissions",
                 ]
             )
@@ -91,18 +126,15 @@ class ClaudeProcess:
 
             # Start process from src directory (where Claude works without API key)
             src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            safe_cmd: List[str] = []
-            redact_next = False
-            for part in cmd:
-                if redact_next:
-                    safe_cmd.append("<redacted>")
-                    redact_next = False
-                    continue
-                if part in ("-p", "--system-prompt", "--json-schema"):
-                    safe_cmd.append(part)
-                    redact_next = True
-                    continue
-                safe_cmd.append(part)
+            command_length = _command_line_length(cmd)
+            if command_length > _MAX_COMMAND_LINE_CHARS:
+                raise ClaudeProcessStartError(
+                    f"Claude command line is {command_length} characters, over "
+                    f"the {_MAX_COMMAND_LINE_CHARS} limit. Reduce the system "
+                    "prompt or the number of tools."
+                )
+
+            safe_cmd = _redact_command(cmd)
             logger.info(f"Starting Claude from directory: {src_dir}")
             logger.info(f"Command: {' '.join(safe_cmd)}")
 
@@ -112,14 +144,18 @@ class ClaudeProcess:
                 cwd=src_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE,
             )
 
             self.is_running = True
 
-            # Start background tasks to read output
+            # Readers first, then the write. A prompt larger than the pipe
+            # buffer can only be written while something is draining stdout,
+            # otherwise both sides block forever.
             self._output_task = asyncio.create_task(self._read_output())
             self._error_task = asyncio.create_task(self._read_error())
+
+            await self._write_prompt(prompt)
 
             started = await self._verify_startup()
             if not started:
@@ -137,6 +173,37 @@ class ClaudeProcess:
                 error=str(e),
             )
             return False
+
+    async def _write_prompt(self, prompt: str) -> None:
+        """Hand the prompt to the CLI on stdin and close the stream.
+
+        The close is what actually ends the prompt - the CLI reads until EOF.
+        Leaving the pipe open with nothing written is what made stdin DEVNULL
+        in the first place (see "Avoid Claude CLI stdin wait warnings"), so the
+        close is the guarantee that this does not reintroduce that wait.
+        """
+        stdin = self.process.stdin if self.process else None
+        if stdin is None:
+            return
+
+        try:
+            stdin.write(prompt.encode("utf-8"))
+            await stdin.drain()
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.warning(
+                "Claude closed stdin before the prompt was written",
+                session_id=self.session_id,
+                error=str(e),
+            )
+        finally:
+            try:
+                stdin.close()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug(
+                    "Failed to close Claude stdin",
+                    session_id=self.session_id,
+                    error=str(e),
+                )
 
     def _decode_output_line(self, line: bytes) -> Optional[Dict[str, Any]]:
         line_text = line.decode().strip()

@@ -26,5 +26,17 @@
       "classify this document"
     ],
     "file": "claude_stream_tool_bridge.jsonl"
+  },
+  {
+    "match": [
+      "weather in paris"
+    ],
+    "file": "claude_stream_weather_call.jsonl"
+  },
+  {
+    "match": [
+      "temp_c"
+    ],
+    "file": "claude_stream_weather_answer.jsonl"
   }
 ]

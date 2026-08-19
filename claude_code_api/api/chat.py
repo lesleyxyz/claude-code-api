@@ -15,6 +15,7 @@ from claude_code_api.core.claude_manager import (
     ClaudeSessionConflictError,
     create_project_directory,
 )
+from claude_code_api.core.config import settings
 from claude_code_api.core.session_manager import SessionManager
 from claude_code_api.models.claude import get_default_model, validate_claude_model
 from claude_code_api.models.openai import (
@@ -35,6 +36,11 @@ from claude_code_api.utils.streaming import (
     create_sse_response,
 )
 from claude_code_api.utils.effort import normalize_reasoning_effort
+from claude_code_api.utils.history import (
+    NoConversationTurnError,
+    current_turn_text,
+    render_prompt,
+)
 from claude_code_api.utils.time import utc_timestamp
 from claude_code_api.utils.tools import ToolBridge, build_tool_bridge
 
@@ -194,6 +200,12 @@ def _apply_tool_bridge(
 
 
 def _extract_prompts(request: ChatCompletionRequest) -> Tuple[str, str]:
+    """Render the request into the (prompt, system prompt) pair the CLI takes.
+
+    System messages stay in --system-prompt rather than being folded into the
+    transcript: they are instructions, not conversation, and they need to stay
+    adjacent to the tool-bridge block `_merge_system_prompt` appends.
+    """
     if not request.messages:
         raise _http_error(
             status.HTTP_400_BAD_REQUEST,
@@ -201,21 +213,31 @@ def _extract_prompts(request: ChatCompletionRequest) -> Tuple[str, str]:
             "invalid_request_error",
             "missing_messages",
         )
-    user_messages = [msg for msg in request.messages if msg.role == "user"]
-    if not user_messages:
+
+    system_texts = [
+        text
+        for msg in request.messages
+        if msg.role == "system"
+        for text in (msg.get_text_content().strip(),)
+        if text
+    ]
+    system_prompt = "\n\n".join(system_texts) if system_texts else request.system_prompt
+
+    # Read the settings lazily: the tests mutate the singleton in place.
+    try:
+        user_prompt = render_prompt(
+            request.messages,
+            mode=settings.conversation_history,
+            max_chars=settings.conversation_history_max_chars,
+        )
+    except NoConversationTurnError as e:
         raise _http_error(
             status.HTTP_400_BAD_REQUEST,
-            "At least one user message is required",
+            str(e),
             "invalid_request_error",
             "missing_user_message",
-        )
-    user_prompt = user_messages[-1].get_text_content()
-    system_messages = [msg for msg in request.messages if msg.role == "system"]
-    system_prompt = (
-        system_messages[0].get_text_content()
-        if system_messages
-        else request.system_prompt
-    )
+        ) from e
+
     return user_prompt, system_prompt
 
 
@@ -1022,7 +1044,9 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
         # Update session with user message
         await session_manager.update_session(
             session_id=api_session_id,
-            message_content=user_prompt,
+            # What the user said, not the whole transcript that was rendered
+            # around it. Tokens still track what the CLI was charged for.
+            message_content=current_turn_text(request.messages),
             role="user",
             tokens_used=estimate_tokens(user_prompt),
         )

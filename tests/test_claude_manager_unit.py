@@ -58,16 +58,36 @@ def spawn_recorder(monkeypatch):
     Nothing is spawned, so this is the cheap way to pin how the CLI command
     line is built. Returns a dict with "argv" and "kwargs".
     """
-    calls = {"argv": [], "kwargs": {}}
+    calls = {"argv": [], "kwargs": {}, "stdin": None}
 
     class EmptyStream:
         async def readline(self):
             return b""
 
+    class FakeStdin:
+        """Records what start() hands the CLI on stdin."""
+
+        def __init__(self):
+            self.buffer = b""
+            self.closed = False
+            self.drained = 0
+
+        def write(self, data):
+            self.buffer += data
+
+        async def drain(self):
+            self.drained += 1
+
+        def close(self):
+            self.closed = True
+
     class FakeProcess:
         stdout = EmptyStream()
         stderr = EmptyStream()
         returncode = None
+
+        def __init__(self):
+            self.stdin = FakeStdin()
 
         def terminate(self):
             pass
@@ -78,7 +98,9 @@ def spawn_recorder(monkeypatch):
     async def fake_create_subprocess_exec(*args, **kwargs):
         calls["argv"] = list(args)
         calls["kwargs"].update(kwargs)
-        return FakeProcess()
+        process = FakeProcess()
+        calls["stdin"] = process.stdin
+        return process
 
     async def fake_verify_startup(self):
         return True
@@ -96,13 +118,78 @@ def flag_value(argv, flag):
 
 
 @pytest.mark.asyncio
-async def test_claude_process_redirects_stdin_to_devnull(monkeypatch):
+async def test_prompt_is_written_to_stdin_and_closed(monkeypatch):
+    """The close is what ends the prompt: the CLI reads stdin until EOF."""
     process = cm.ClaudeProcess(session_id="sess", project_path="/tmp")
     calls = spawn_recorder(monkeypatch)
 
     try:
         assert await process.start(prompt="hello") is True
-        assert calls["kwargs"]["stdin"] == asyncio.subprocess.DEVNULL
+        assert calls["kwargs"]["stdin"] == asyncio.subprocess.PIPE
+        assert calls["stdin"].buffer.decode("utf-8") == "hello"
+        assert calls["stdin"].closed is True
+    finally:
+        await process.stop()
+
+
+@pytest.mark.asyncio
+async def test_prompt_never_appears_in_argv(monkeypatch):
+    """A long conversation must not be able to overflow the command line."""
+    process = cm.ClaudeProcess(session_id="sess", project_path="/tmp")
+    calls = spawn_recorder(monkeypatch)
+    prompt = "a very long conversation transcript"
+
+    try:
+        assert await process.start(prompt=prompt) is True
+        argv = calls["argv"]
+        assert prompt not in argv
+        # -p is a bare flag now; nothing follows it but another flag.
+        following = argv[argv.index("-p") + 1 :]
+        assert not following or following[0].startswith("-")
+    finally:
+        await process.stop()
+
+
+def test_redaction_keeps_secret_values_out_of_logs():
+    """Regression: -p must not be treated as carrying a value.
+
+    When it was, it consumed the *next flag name* as its value, and that
+    flag's own value was then logged in the clear.
+    """
+    safe = cm._redact_command(
+        [
+            "claude",
+            "-p",
+            "--system-prompt",
+            "SECRET SYSTEM PROMPT",
+            "--json-schema",
+            '{"secret": true}',
+            "--model",
+            "claude-sonnet-4-5-20250929",
+        ]
+    )
+
+    assert "SECRET SYSTEM PROMPT" not in safe
+    assert '{"secret": true}' not in safe
+    # Flag names survive, so the log still shows the shape of the command.
+    assert "--system-prompt" in safe
+    assert "--json-schema" in safe
+    # Non-secret values are untouched.
+    assert "claude-sonnet-4-5-20250929" in safe
+
+
+@pytest.mark.asyncio
+async def test_oversized_command_line_is_rejected(monkeypatch):
+    """A huge system prompt fails with a clear message, not a CreateProcess OSError."""
+    process = cm.ClaudeProcess(session_id="sess", project_path="/tmp")
+    spawn_recorder(monkeypatch)
+
+    try:
+        started = await process.start(
+            prompt="hi", system_prompt="x" * (cm._MAX_COMMAND_LINE_CHARS + 1)
+        )
+        assert started is False
+        assert "over the" in (process.last_error or "")
     finally:
         await process.stop()
 

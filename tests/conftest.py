@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from httpx import AsyncClient
 
 from claude_code_api.core.config import settings
+from claude_code_api.utils.history import CURRENT_TURN_OPEN
 
 # Now import the app and configuration
 from claude_code_api.main import app
@@ -23,6 +24,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 # fixture. Nothing asserts on the real CLI's argv, so this is the only way to
 # check that a request-level flag actually reaches the binary.
 CLI_ARGV_LOG_NAME = "claude_argv.jsonl"
+CLI_PROMPT_LOG_NAME = "claude_prompt.jsonl"
 
 
 def _serialize_fixture_rules(fixture_rules, fixtures_dir: Path):
@@ -47,6 +49,7 @@ def _create_mock_claude_binary(
     fixture_rules,
     fixtures_dir: Path,
     argv_log: Path,
+    prompt_log: Path,
 ) -> str:
     """Create a mock Claude CLI launcher that works on POSIX and Windows."""
     serialized_rules = _serialize_fixture_rules(fixture_rules, fixtures_dir)
@@ -60,6 +63,8 @@ def _create_mock_claude_binary(
             f"DEFAULT_FIXTURE = {str(default_fixture)!r}",
             f"FIXTURE_RULES = {serialized_rules!r}",
             f"ARGV_LOG = {str(argv_log)!r}",
+            f"PROMPT_LOG = {str(prompt_log)!r}",
+            f"CURRENT_TURN_OPEN = {CURRENT_TURN_OPEN!r}",
             "",
             "def _record(args):",
             "    try:",
@@ -70,15 +75,31 @@ def _create_mock_claude_binary(
             "",
             "def _extract_prompt(args):",
             "    for idx, value in enumerate(args):",
-            "        if value == '-p' and idx + 1 < len(args):",
-            "            return args[idx + 1]",
+            "        if value == '-p':",
+            "            nxt = args[idx + 1] if idx + 1 < len(args) else None",
+            "            if nxt is not None and not nxt.startswith('-'):",
+            "                return nxt",
+            "            return sys.stdin.read()",
             "    return ''",
             "",
+            "def _record_prompt(prompt):",
+            "    try:",
+            "        with open(PROMPT_LOG, 'a', encoding='utf-8') as handle:",
+            "            handle.write(json.dumps(prompt) + '\\n')",
+            "    except OSError:",
+            "        pass",
+            "",
             "def _resolve_fixture(prompt):",
-            "    prompt_lower = prompt.lower()",
+            "    # Match against the current turn only. Rules are substrings and",
+            "    # the LAST match wins, so transcript scaffolding would otherwise",
+            "    # steer selection: the 'hi' rule alone is hit by 'this',",
+            "    # 'which' and 'history'. Keep this window narrow.",
+            "    marker = prompt.rfind(CURRENT_TURN_OPEN)",
+            "    window = prompt[marker:] if marker != -1 else prompt",
+            "    window_lower = window.lower()",
             "    fixture_path = DEFAULT_FIXTURE",
             "    for rule in FIXTURE_RULES:",
-            "        if any(match in prompt_lower for match in rule['matches']):",
+            "        if any(match in window_lower for match in rule['matches']):",
             "            fixture_path = rule['fixture_path']",
             "    return fixture_path",
             "",
@@ -89,6 +110,7 @@ def _create_mock_claude_binary(
             "        return 0",
             "    _record(args)",
             "    prompt = _extract_prompt(args)",
+            "    _record_prompt(prompt)",
             "    fixture_path = _resolve_fixture(prompt)",
             "    with open(fixture_path, 'r', encoding='utf-8') as handle:",
             "        sys.stdout.write(handle.read())",
@@ -163,6 +185,7 @@ def setup_test_environment():
             fixture_rules=fixture_rules,
             fixtures_dir=fixtures_dir,
             argv_log=Path(temp_dir) / CLI_ARGV_LOG_NAME,
+            prompt_log=Path(temp_dir) / CLI_PROMPT_LOG_NAME,
         )
     else:
         # Ensure the real binary is available when requested
@@ -201,6 +224,30 @@ def cli_argv(setup_test_environment):
         pytest.skip("argv recording requires the fixture CLI")
 
     log_path = Path(setup_test_environment) / CLI_ARGV_LOG_NAME
+    log_path.write_text("", encoding="utf-8")  # isolate this test
+
+    def _read():
+        if not log_path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    return _read
+
+
+@pytest.fixture
+def cli_prompt(setup_test_environment):
+    """Return a callable giving the prompt each mock-CLI run received.
+
+    The prompt travels on stdin now, so it is no longer visible in `cli_argv`.
+    """
+    if os.environ.get("CLAUDE_CODE_API_USE_REAL_CLAUDE") == "1":
+        pytest.skip("prompt recording requires the fixture CLI")
+
+    log_path = Path(setup_test_environment) / CLI_PROMPT_LOG_NAME
     log_path.write_text("", encoding="utf-8")  # isolate this test
 
     def _read():

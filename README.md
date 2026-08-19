@@ -4,6 +4,7 @@ OpenAI-compatible API gateway for Claude Code CLI.
 This is a fork based on codingworkflow's claude-code-api with the following additional functionalities:
 - Support for json_schema
 - Support for function tools
+- Support for multi-turn conversation history, including agent tool loops
 - Support for `/v1/responses` API
 - Support for reasoning/effort levels using both OpenAI/Anthropic enums
 - Daily docker builds for vulnerabilities at `ghcr.io/lesleyxyz/claude-code-api:latest`
@@ -23,14 +24,17 @@ This project is a wrapper around claude-code CLI such that it does not violate A
 These follow from wrapping the Claude Code CLI, which is a coding agent rather
 than a completions endpoint:
 
-- **No conversation history.** Only the last `user` message reaches the CLI.
-  Earlier turns, prior assistant replies and `role: "tool"` results are dropped,
-  so an agent loop that feeds a tool result back gets the same tool call again
-  instead of an answer.
+- **Conversation history is replayed, not resumed.** The CLI takes a single
+  prompt, so the whole message array is rendered into it on every request and
+  the client stays the source of truth (as OpenAI clients expect). Multi-turn
+  requests therefore cost more input tokens than a native chat endpoint, and
+  very long conversations are truncated oldest-first. Controlled by
+  `CONVERSATION_HISTORY`; set it to `off` for the old last-message-only
+  behaviour. A single-message request is unaffected either way.
 - **`tools` are emulated, not native.** The CLI has no caller-supplied tools, so
   they are described in the system prompt and the reply is constrained with
-  `--json-schema`. One-shot tool calling works; combined with the point above,
-  multi-turn tool loops do not.
+  `--json-schema`. Note that `tool_calls[].function.arguments` must be a JSON
+  *string*, as in the OpenAI schema; sending an object gets a 422.
 - **No token-level streaming.** SSE chunks track whole assistant messages, so a
   single-turn answer arrives as one chunk once it is finished. The CLI's
   `--include-partial-messages` would allow finer deltas but is not wired up.
@@ -178,11 +182,20 @@ gateway logs a warning.
 
 ## Configuration
 
-Common settings are in `claude_code_api/core/config.py`:
+Common settings are in `claude_code_api/core/config.py`. Every field is
+settable as an environment variable of the same name (case-insensitive).
+
 - `claude_binary_path`
 - `project_root`
 - `database_url`
 - `require_auth`
+
+Conversation history:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CONVERSATION_HISTORY` | `flatten` | `off` sends only the last user message. `flatten` renders the whole array into the prompt. `resume` is reserved for reusing the CLI session. |
+| `CONVERSATION_HISTORY_MAX_CHARS` | `200000` | Cap on the rendered history. Oldest messages are dropped first and the prompt says so; the newest turn is never truncated. `0` disables the cap. |
 
 ## Bug Reports & Support
 

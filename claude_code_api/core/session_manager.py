@@ -7,13 +7,14 @@ import tempfile
 import uuid
 from datetime import timedelta
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import structlog
 
 from claude_code_api.core.config import settings
 from claude_code_api.core.database import db_manager
 from claude_code_api.models.claude import get_default_model
+from claude_code_api.utils.ledger import SessionLedger, chain_hash, match_prefix
 from claude_code_api.utils.time import utc_now
 
 logger = structlog.get_logger()
@@ -52,6 +53,15 @@ class SessionManager:
     def __init__(self):
         self.active_sessions: Dict[str, SessionInfo] = {}
         self.cli_session_index: Dict[str, str] = {}
+        # What each Claude session has already been told. In memory only,
+        # on purpose: see claude_code_api/utils/ledger.py. Losing this makes
+        # the next request replay the transcript, which is correct but
+        # costlier; keeping it across a restart could pair a live ledger
+        # with a Claude session that no longer exists.
+        self.ledgers: Dict[str, SessionLedger] = {}
+        # Conversation prefix hash -> API session id. OpenAI clients carry
+        # no session id, so a resumable session has to be found by content.
+        self.conversation_index: Dict[str, str] = {}
         self.session_map_path = settings.session_map_path
         self._persist_lock = Lock()
         self.cleanup_task: Optional[asyncio.Task] = None
@@ -319,6 +329,55 @@ class SessionManager:
             session_info.cli_session_id = cli_session_id
         self.cli_session_index[cli_session_id] = api_session_id
         self._persist_cli_session_map()
+
+    def get_ledger(self, session_id: str) -> Optional[SessionLedger]:
+        """The ledger for a session, or None if nothing has been sent yet."""
+        resolved = self._resolve_session_id(session_id) or session_id
+        return self.ledgers.get(resolved)
+
+    def find_resumable(self, fingerprints: Sequence[str]) -> Optional[tuple]:
+        """The session already holding the longest prefix of this conversation.
+
+        Returns (session id, messages already sent) or None.
+        """
+        matched = match_prefix(self.conversation_index, fingerprints)
+        if matched is None:
+            return None
+        session_id, sent = matched
+        if session_id not in self.ledgers:
+            # The ledger went but the index did not; treat it as unknown.
+            return None
+        return session_id, sent
+
+    def record_turn(
+        self,
+        session_id: str,
+        messages: Sequence[Any],
+        tool_names: Dict[str, str],
+        system_fingerprint: Optional[str] = None,
+    ) -> None:
+        """Note what a session has now been told, so the next delta is right.
+
+        Called after a turn succeeds, never before: if the turn failed or the
+        client hung up, the ledger stays behind and the next request falls back
+        to replaying the transcript.
+        """
+        resolved = self._resolve_session_id(session_id) or session_id
+        ledger = self.ledgers.get(resolved)
+        if ledger is None:
+            ledger = SessionLedger(system_fingerprint=system_fingerprint)
+            self.ledgers[resolved] = ledger
+        ledger.extend(messages, tool_names)
+        # Index the conversation as it now stands, so the next request can
+        # find this session by content alone.
+        self.conversation_index[chain_hash(ledger.fingerprints)] = resolved
+
+    def discard_ledger(self, session_id: str) -> None:
+        """Forget a session's history, forcing a full replay next time."""
+        resolved = self._resolve_session_id(session_id) or session_id
+        self.ledgers.pop(resolved, None)
+        for key in [k for k, v in self.conversation_index.items() if v == resolved]:
+            del self.conversation_index[key]
 
     def _resolve_session_id(self, session_id: str) -> Optional[str]:
         if session_id in self.active_sessions:

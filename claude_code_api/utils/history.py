@@ -198,6 +198,11 @@ def _tool_call_names(messages: Sequence[Any]) -> Dict[str, str]:
     return names
 
 
+def tool_call_names(messages: Sequence[Any]) -> Dict[str, str]:
+    """Public view of the call-id to tool-name map, for the ledger."""
+    return _tool_call_names(messages)
+
+
 def _render_message(message: Any, tool_names: Dict[str, str]) -> Optional[str]:
     """Render one message, or None when it carries nothing worth sending."""
     role = _role(message)

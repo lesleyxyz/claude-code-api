@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+from types import SimpleNamespace
 import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
@@ -39,6 +40,14 @@ from claude_code_api.utils.streaming import (
 )
 from claude_code_api.utils.effort import normalize_reasoning_effort
 from claude_code_api.utils.engine import ENGINE_SDK
+from claude_code_api.utils.ledger import (
+    MODE_RESUME,
+    conversation_fingerprints,
+    fingerprint_system,
+    is_session_missing_error,
+    plan_turn,
+)
+from claude_code_api.utils.history import tool_call_names as history_tool_call_names
 from claude_code_api.utils.history import (
     NoConversationTurnError,
     current_turn_text,
@@ -221,6 +230,76 @@ def _apply_tool_bridge(
         bridge,
         bridge.schema,
         _merge_system_prompt(system_prompt, bridge.instructions),
+    )
+
+
+def _plan_conversation(
+    request: ChatCompletionRequest,
+    session_manager: SessionManager,
+    system_prompt: Optional[str],
+) -> Tuple[Any, Optional[str]]:
+    """Decide how to run this turn, and which session it belongs to.
+
+    Returns (plan, session id to reuse). The session id is None when nothing
+    resumable was found, in which case the caller creates one as before.
+
+    Resuming is only attempted on the SDK engine: the CLI engine has no way to
+    hand a client-executed tool result back into a running conversation.
+    """
+    resume_enabled = (
+        settings.engine == ENGINE_SDK and settings.conversation_history == MODE_RESUME
+    )
+    if not resume_enabled:
+        return None, None
+
+    fingerprints = conversation_fingerprints(request.messages)
+    matched = session_manager.find_resumable(fingerprints)
+    if matched is None:
+        return None, None
+
+    matched_session_id, _already_sent = matched
+    session_info = session_manager.active_sessions.get(matched_session_id)
+    sdk_session_id = session_info.cli_session_id if session_info else None
+
+    plan = plan_turn(
+        request.messages,
+        session_manager.get_ledger(matched_session_id),
+        sdk_session_id,
+        system_prompt,
+        MODE_RESUME,
+        max_chars=settings.conversation_history_max_chars,
+    )
+    if not plan.resuming:
+        logger.info(
+            "Not resuming this turn", reason=plan.reason, session_id=matched_session_id
+        )
+        return None, None
+
+    logger.info(
+        "Resuming an existing Claude session",
+        session_id=matched_session_id,
+        sdk_session_id=sdk_session_id,
+        reason=plan.reason,
+    )
+    return plan, matched_session_id
+
+
+def _assistant_echo(response: Dict[str, Any]) -> Optional[Any]:
+    """The assistant message as the client will send it back next turn.
+
+    Recorded so the following request's history lines up with what the session
+    was actually told; without it every turn after the first would diverge.
+    """
+    choices = response.get("choices") or []
+    if not choices:
+        return None
+    message = choices[0].get("message") or {}
+    return SimpleNamespace(
+        role="assistant",
+        content=message.get("content"),
+        tool_calls=message.get("tool_calls"),
+        tool_call_id=None,
+        name=None,
     )
 
 
@@ -1057,14 +1136,25 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
         project_id = request.project_id or f"default-{client_id}"
         project_path = create_project_directory(project_id)
 
-        # Handle session management
-        session_id = await _resolve_session(
-            session_manager=session_manager,
-            request=request,
-            project_id=project_id,
-            claude_model=claude_model,
-            system_prompt=system_prompt,
+        # Continue an existing Claude session when this conversation is one
+        # we have already been part of, so only the new messages are sent.
+        turn_plan, resumable_session_id = _plan_conversation(
+            request, session_manager, system_prompt
         )
+        if turn_plan is not None:
+            user_prompt = turn_plan.prompt
+
+        # Handle session management
+        if resumable_session_id is not None and not request.session_id:
+            session_id = resumable_session_id
+        else:
+            session_id = await _resolve_session(
+                session_manager=session_manager,
+                request=request,
+                project_id=project_id,
+                claude_model=claude_model,
+                system_prompt=system_prompt,
+            )
 
         # Start Claude Code process
         try:
@@ -1075,18 +1165,45 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
             engine_kwargs = {}
             if settings.engine == ENGINE_SDK and request.tools:
                 engine_kwargs["client_tools"] = request.tools
+            if turn_plan is not None and turn_plan.resuming:
+                engine_kwargs["resume"] = turn_plan.resume_session_id
 
-            claude_process = await claude_manager.create_session(
-                session_id=session_id,
-                project_path=project_path,
-                prompt=user_prompt,
-                model=claude_model,
-                system_prompt=system_prompt,
-                on_cli_session_id=_register_cli_session,
-                json_schema=json_schema,
-                effort=effort,
-                **engine_kwargs,
-            )
+            async def _start(prompt: str, **extra):
+                return await claude_manager.create_session(
+                    session_id=session_id,
+                    project_path=project_path,
+                    prompt=prompt,
+                    model=claude_model,
+                    system_prompt=system_prompt,
+                    on_cli_session_id=_register_cli_session,
+                    json_schema=json_schema,
+                    effort=effort,
+                    **extra,
+                )
+
+            try:
+                claude_process = await _start(user_prompt, **engine_kwargs)
+            except Exception as e:
+                if not (
+                    turn_plan is not None
+                    and turn_plan.resuming
+                    and is_session_missing_error(e)
+                ):
+                    raise
+                # Claude no longer has the session we recorded - it may have
+                # been pruned, or the gateway may be talking to a different
+                # host than the one that created it. Replay the transcript
+                # instead; the ledger is wrong, so drop it.
+                logger.warning(
+                    "Resume failed, replaying the full conversation",
+                    session_id=session_id,
+                    error=str(e),
+                )
+                session_manager.discard_ledger(session_id)
+                turn_plan = None
+                engine_kwargs.pop("resume", None)
+                user_prompt, _ = _extract_prompts(request)
+                claude_process = await _start(user_prompt, **engine_kwargs)
         except ClaudeSessionConflictError as e:
             logger.warning(
                 "Session already has an active Claude process",
@@ -1171,6 +1288,28 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
                 },
             )
 
+        def _record_turn(response: Dict[str, Any]) -> None:
+            """Note what this session has now been told, once the turn worked."""
+            if settings.engine != ENGINE_SDK:
+                return
+            if settings.conversation_history != MODE_RESUME:
+                return
+
+            consumed = (
+                list(turn_plan.consumed)
+                if turn_plan is not None
+                else [m for m in request.messages if m.role != "system"]
+            )
+            echo = _assistant_echo(response)
+            if echo is not None:
+                consumed.append(echo)
+            session_manager.record_turn(
+                session_id,
+                consumed,
+                history_tool_call_names(request.messages),
+                system_fingerprint=fingerprint_system(system_prompt),
+            )
+
         completion = await _collect_non_streaming_response(
             claude_process=claude_process,
             session_manager=session_manager,
@@ -1182,6 +1321,7 @@ async def create_chat_completion(request: ChatCompletionRequest, req: Request) -
             suppress_internal_tools=_suppress_internal_tools(request, json_schema),
         )
         _warn_if_tools_went_unused(request, completion)
+        _record_turn(completion)
         return completion
 
     except HTTPException:

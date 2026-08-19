@@ -196,6 +196,7 @@ class SdkSession:
         system_prompt: Optional[str],
         effort: Optional[str],
         json_schema: Optional[Dict[str, Any]] = None,
+        resume: Optional[str] = None,
     ) -> Any:
         from claude_agent_sdk import ClaudeAgentOptions
 
@@ -217,6 +218,11 @@ class SdkSession:
         if self._tool_server is not None:
             options["mcp_servers"] = {CLIENT_TOOL_SERVER: self._tool_server}
             options["allowed_tools"] = self._allowed_tools
+        if resume:
+            # Continue the conversation Claude already holds, so only the new
+            # messages travel. A stale id fails loudly with "No conversation
+            # found", which the caller catches and retries as a full replay.
+            options["resume"] = resume
         if json_schema is not None:
             # The SDK keeps its StructuredOutput tool available for this even
             # though `tools` is empty, so the two do not conflict. Verified
@@ -236,6 +242,7 @@ class SdkSession:
         json_schema: Optional[Dict[str, Any]] = None,
         effort: Optional[str] = None,
         client_tools: Optional[Sequence[Any]] = None,
+        resume: Optional[str] = None,
     ) -> bool:
         """Open an SDK session and begin draining it into `output_queue`."""
         self.last_error = None
@@ -254,7 +261,7 @@ class SdkSession:
             from claude_agent_sdk import ClaudeSDKClient
 
             options = self._build_options(
-                model, system_prompt, effort, json_schema=json_schema
+                model, system_prompt, effort, json_schema=json_schema, resume=resume
             )
             logger.info(
                 "Starting Claude SDK session",
@@ -262,6 +269,7 @@ class SdkSession:
                 project_path=self.project_path,
                 model=model or get_default_model(),
                 effort=effort or "<sdk-default>",
+                resuming=bool(resume),
             )
 
             self._client = ClaudeSDKClient(options=options)
@@ -453,6 +461,7 @@ class SdkManager:
         json_schema: Optional[Dict[str, Any]] = None,
         effort: Optional[str] = None,
         client_tools: Optional[Sequence[Any]] = None,
+        resume: Optional[str] = None,
     ) -> SdkSession:
         from .claude_manager import (
             ClaudeProcessStartError,
@@ -482,6 +491,7 @@ class SdkManager:
                 json_schema=json_schema,
                 effort=effort,
                 client_tools=client_tools,
+                resume=resume,
             )
             if not started:
                 raise ClaudeProcessStartError(

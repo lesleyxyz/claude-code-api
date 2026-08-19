@@ -195,7 +195,7 @@ Conversation history:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CONVERSATION_HISTORY` | `flatten` | `off` sends only the last user message. `flatten` renders the whole array into the prompt. `resume` is reserved for reusing the CLI session. |
+| `CONVERSATION_HISTORY` | `flatten` | `off` sends only the last user message. `flatten` renders the whole array into the prompt every turn. `resume` continues the Claude session and sends only the new messages (SDK engine only). |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `200000` | Cap on the rendered history. Oldest messages are dropped first and the prompt says so; the newest turn is never truncated. `0` disables the cap. |
 
 Engine:
@@ -227,6 +227,29 @@ Authentication follows the SDK: `ANTHROPIC_API_KEY` when set, otherwise the
 signed-in Claude Code session. Note that Anthropic's Agent SDK documentation
 states that third-party developers may not offer claude.ai login for their
 products without prior approval, and directs them to API key authentication.
+
+### Resuming instead of replaying
+
+`CONVERSATION_HISTORY=resume` continues the conversation Claude already holds
+rather than rebuilding it, so a long chat costs one message per turn instead of
+the whole transcript. It works on the `sdk` engine only: the CLI engine has no
+way to hand a client-executed tool result back into a running conversation.
+
+OpenAI clients carry no session id, so the conversation is identified by
+content: each turn is fingerprinted and the resulting chain locates the session
+that already holds this exact prefix. Resuming is abandoned, and the transcript
+replayed instead, whenever that cannot be proven - the client edited, trimmed or
+reordered history, the system prompt changed, or the session is simply unknown.
+Every such decision is logged with a reason.
+
+If Claude no longer has the session, the SDK fails loudly with
+`No conversation found with session ID`; the gateway catches that, drops its
+record and retries with the full transcript, so the answer is still correct.
+
+The bookkeeping is kept in memory and never persisted. Losing it on restart
+means falling back to replaying - correct, just costlier. Persisting it would
+risk the opposite: a delta sent into a session that no longer holds the
+conversation behind it.
 
 Large prompts:
 

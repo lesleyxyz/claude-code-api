@@ -179,6 +179,16 @@ class Settings(BaseSettings):
     # Database Configuration
     database_url: str = "sqlite:///./claude_api.db"
 
+    # Server Configuration
+    # Uvicorn's autoreloader keeps its supervising process alive even when the
+    # worker's startup (lifespan) raises, e.g. a transient binary-availability
+    # check racing a freshly mounted volume at container boot. That leaves a
+    # process that answers to nothing and no listening socket, which defeats
+    # `restart: unless-stopped` since Docker never observes an exit. Default
+    # off so a failed startup actually exits and gets restarted; opt into dev
+    # reload explicitly via RELOAD=true.
+    reload: bool = False
+
     # Logging Configuration
     log_level: str = "INFO"
     access_log: bool = False

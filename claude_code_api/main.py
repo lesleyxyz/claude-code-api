@@ -250,7 +250,7 @@ if __name__ == "__main__":
         "claude_code_api.main:app",
         host=settings.host,
         port=settings.port,
-        reload=True,
+        reload=settings.reload,
         log_level=settings.log_level.lower(),
         access_log=settings.access_log,
     )
